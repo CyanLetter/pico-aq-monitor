@@ -6,16 +6,19 @@ license = "MIT OR Apache-2.0"
 description = "ENS160 air quality sensor on Raspberry Pi Pico W"
 
 [dependencies]
-# Embassy framework (git dependencies for latest APIs)
-embassy-embedded-hal = { git = "https://github.com/embassy-rs/embassy", features = ["defmt"] }
-embassy-sync = { git = "https://github.com/embassy-rs/embassy", features = ["defmt"] }
-embassy-executor = { git = "https://github.com/embassy-rs/embassy", features = ["arch-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
-embassy-time = { git = "https://github.com/embassy-rs/embassy", features = ["defmt", "defmt-timestamp-uptime"] }
-embassy-rp = { git = "https://github.com/embassy-rs/embassy", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp2040"] }
-embassy-usb = { git = "https://github.com/embassy-rs/embassy", features = ["defmt"] }
-embassy-usb-logger = { git = "https://github.com/embassy-rs/embassy" }
-cyw43 = { git = "https://github.com/embassy-rs/embassy", features = ["defmt", "firmware-logs"] }
-cyw43-pio = { git = "https://github.com/embassy-rs/embassy", features = ["defmt"] }
+# Embassy framework (crates.io)
+embassy-embedded-hal = { version = "0.5.0", features = ["defmt"] }
+embassy-sync = { version = "0.7.2", features = ["defmt"] }
+embassy-executor = { version = "0.9.0", features = ["arch-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
+embassy-time = { version = "0.5.0", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-rp = { version = "0.9.0", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp2040"] }
+embassy-usb = { version = "0.5.1", features = ["defmt"] }
+embassy-usb-logger = "0.5.1"
+
+# CYW43 WiFi chip (for Pico W onboard LED)
+cyw43 = { version = "0.6.0", features = ["defmt", "firmware-logs"] }
+cyw43-pio = { version = "0.9.0", features = ["defmt"] }
+cyw43-firmware = { version = "0.1.0", features = ["wifi"] }
 
 # Sensor driver
 ens160-aq = { version = "0.2.11", default-features = false, features = ["async"] }

@@ -1,12 +1,12 @@
 //! ENS160 Air Quality Sensor for RP Pico W
 //!
-//! Reads raw air quality data from an ENS160 sensor over I2C and logs it.
-//! Supports both RTT (with debug probe) and USB serial logging.
+//! Reads raw air quality data from an ENS160 sensor over I2C and logs it via RTT.
+//! Use a debug probe (like probe-rs) to view the logs.
 
 #![no_std]
 #![no_main]
 
-use cyw43::aligned_bytes;
+use cyw43_firmware::{CYW43_43439A0 as FIRMWARE, CYW43_43439A0_CLM as CLM};
 use cyw43_pio::{DEFAULT_CLOCK_DIVIDER, PioSpi};
 use defmt::Debug2Format;
 use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
@@ -16,16 +16,18 @@ use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::i2c::{Async, Config as I2cConfig, I2c, InterruptHandler as I2cInterruptHandler};
 use embassy_rp::peripherals::{DMA_CH0, I2C0, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
-use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
+use embassy_rp::usb::Driver;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Delay, Duration, Timer};
+use embassy_usb_logger::ReceiverHandler;
 use ens160_aq::data::InterruptPinConfig;
 use ens160_aq::Ens160;
 use static_cell::StaticCell;
 
-use defmt::unwrap;
 use {defmt_rtt as _, panic_probe as _};
+
+use embassy_rp::usb::InterruptHandler as UsbInterruptHandler;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
@@ -35,14 +37,27 @@ bind_interrupts!(struct Irqs {
 
 #[embassy_executor::task]
 async fn cyw43_task(
-    runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>>,
+    runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>,
 ) -> ! {
     runner.run().await
 }
 
+/// USB serial logger task
+struct Handler;
+
+impl ReceiverHandler for Handler {
+    fn new() -> Self {
+        Handler
+    }
+
+    async fn handle_data(&self, _data: &[u8]) {
+        // Ignore incoming data from USB serial
+    }
+}
+
 #[embassy_executor::task]
 async fn logger_task(driver: Driver<'static, USB>) {
-    embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
+    embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver, Handler);
 }
 
 /// I2C bus type alias
@@ -61,8 +76,8 @@ const READ_INTERVAL: u64 = 5;
 async fn scan_i2c_bus(i2c: &mut I2c<'static, I2C0, Async>) {
     use embedded_hal_async::i2c::I2c as _;
 
-    log::info!("Scanning I2C bus...");
     defmt::info!("Scanning I2C bus...");
+    log::info!("Scanning I2C bus...");
 
     let mut found_count = 0;
 
@@ -71,18 +86,18 @@ async fn scan_i2c_bus(i2c: &mut I2c<'static, I2C0, Async>) {
         // Try to read a single byte from each address
         let mut buf = [0u8; 1];
         if i2c.read(addr, &mut buf).await.is_ok() {
-            log::info!("  Found device at address 0x{:02X}", addr);
             defmt::info!("  Found device at address 0x{:02X}", addr);
+            log::info!("  Found device at address 0x{:02X}", addr);
             found_count += 1;
         }
     }
 
     if found_count == 0 {
-        log::warn!("No I2C devices found!");
         defmt::warn!("No I2C devices found!");
+        log::warn!("No I2C devices found!");
     } else {
-        log::info!("Found {} device(s)", found_count);
         defmt::info!("Found {} device(s)", found_count);
+        log::info!("Found {} device(s)", found_count);
     }
 }
 
@@ -103,12 +118,12 @@ async fn initialize_ens160(
     let mut ens160 = Ens160::new_secondary_address(i2c_device, Delay);
 
     if let Err(e) = ens160.initialize().await {
-        log::error!("Failed to initialize ENS160: {:?}", e);
         defmt::error!("Failed to initialize ENS160: {}", Debug2Format(&e));
+        log::error!("Failed to initialize ENS160: {:?}", e);
         return None;
     }
-    log::info!("ENS160 initialized successfully");
     defmt::info!("ENS160 initialized successfully");
+    log::info!("ENS160 initialized successfully");
 
     // Configure interrupt pin for new data notifications
     match ens160
@@ -122,12 +137,12 @@ async fn initialize_ens160(
         .await
     {
         Ok(val) => {
-            log::info!("ENS160 interrupt pin configured: {}", val);
             defmt::info!("ENS160 interrupt pin configured: {}", val);
+            log::info!("ENS160 interrupt pin configured: {}", val);
         }
         Err(e) => {
-            log::error!("Failed to configure ENS160 interrupt pin: {:?}", e);
             defmt::error!("Failed to configure ENS160 interrupt pin: {}", Debug2Format(&e));
+            log::error!("Failed to configure ENS160 interrupt pin: {:?}", e);
             return None;
         }
     }
@@ -177,13 +192,12 @@ async fn read_ens160(
         aqi: aqi as u8,
     };
 
-    // Log to both USB serial and RTT
-    log::info!(
+    defmt::info!(
         "AQI: {}, eCO2: {} ppm, Ethanol: {} ppb, VOCs: {} ppb",
         readings.aqi, readings.eco2, readings.etoh, readings.tvoc
     );
-    defmt::info!(
-        "ENS160 Raw Readings - AQI: {}, eCO2: {} ppm, Ethanol: {} ppb, VOCs: {} ppb",
+    log::info!(
+        "AQI: {}, eCO2: {} ppm, Ethanol: {} ppb, VOCs: {} ppb",
         readings.aqi, readings.eco2, readings.etoh, readings.tvoc
     );
 
@@ -195,17 +209,19 @@ async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     // Initialize USB serial logger
-    let driver = Driver::new(p.USB, Irqs);
-    spawner.spawn(unwrap!(logger_task(driver)));
+    let usb_driver = Driver::new(p.USB, Irqs);
+    spawner.spawn(logger_task(usb_driver)).unwrap();
 
-    // Give USB time to enumerate before sending logs
-    Timer::after(Duration::from_secs(2)).await;
+    // Give USB time to enumerate before logging
+    Timer::after(Duration::from_millis(100)).await;
+
+    defmt::info!("ENS160 Air Quality Sensor starting...");
     log::info!("ENS160 Air Quality Sensor starting...");
 
     // Initialize CYW43 (WiFi chip) for onboard LED
-    let fw = aligned_bytes!("../cyw43-firmware/43439A0.bin");
-    let clm = aligned_bytes!("../cyw43-firmware/43439A0_clm.bin");
-    let nvram = aligned_bytes!("../cyw43-firmware/nvram_rp2040.bin");
+    // Firmware provided by cyw43-firmware crate
+    let fw = FIRMWARE;
+    let clm = CLM;
 
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs = Output::new(p.PIN_25, Level::High);
@@ -223,8 +239,8 @@ async fn main(spawner: Spawner) {
 
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
-    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
-    spawner.spawn(unwrap!(cyw43_task(runner)));
+    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
+    spawner.spawn(cyw43_task(runner)).unwrap();
 
     control.init(clm).await;
     control
@@ -238,8 +254,8 @@ async fn main(spawner: Spawner) {
     let mut i2c = I2c::new_async(p.I2C0, scl, sda, Irqs, I2cConfig::default());
 
     // Wait for sensor to power up before scanning
-    log::info!("Waiting for I2C devices to power up...");
     defmt::info!("Waiting for I2C devices to power up...");
+    log::info!("Waiting for I2C devices to power up...");
     Timer::after(Duration::from_millis(2000)).await;
 
     // Scan I2C bus to find devices
@@ -259,8 +275,8 @@ async fn main(spawner: Spawner) {
     let mut ens160 = match initialize_ens160(ens160_i2c).await {
         Some(sensor) => sensor,
         None => {
-            log::error!("Failed to initialize ENS160 - halting");
             defmt::error!("Failed to initialize ENS160 - halting");
+            log::error!("Failed to initialize ENS160 - halting");
             loop {
                 // Blink LED rapidly to indicate error
                 control.gpio_set(0, true).await;
@@ -272,9 +288,10 @@ async fn main(spawner: Spawner) {
     };
 
     // Wait for ENS160 warmup period
-    log::info!("Waiting for ENS160 warmup period of {} seconds", WARMUP_TIME);
-    log::info!("LED will blink slowly during warmup...");
     defmt::info!("Waiting for ENS160 warmup period of {} seconds", WARMUP_TIME);
+    log::info!("Waiting for ENS160 warmup period of {} seconds", WARMUP_TIME);
+    defmt::info!("LED will blink slowly during warmup...");
+    log::info!("LED will blink slowly during warmup...");
 
     for i in 0..WARMUP_TIME {
         control.gpio_set(0, true).await;
@@ -283,13 +300,13 @@ async fn main(spawner: Spawner) {
         Timer::after(Duration::from_millis(800)).await;
 
         if (i + 1) % 30 == 0 {
-            log::info!("Warmup: {} / {} seconds", i + 1, WARMUP_TIME);
             defmt::info!("Warmup: {} / {} seconds", i + 1, WARMUP_TIME);
+            log::info!("Warmup: {} / {} seconds", i + 1, WARMUP_TIME);
         }
     }
 
-    log::info!("Warmup complete - starting continuous readings");
     defmt::info!("Warmup complete - starting continuous readings");
+    log::info!("Warmup complete - starting continuous readings");
 
     // Main sensor reading loop
     loop {
@@ -301,8 +318,8 @@ async fn main(spawner: Spawner) {
                 defmt::debug!("Sensor read successful");
             }
             Err(e) => {
-                log::error!("Sensor read failed: {}", e);
                 defmt::error!("Sensor read failed: {}", e);
+                log::error!("Sensor read failed: {}", e);
             }
         }
 

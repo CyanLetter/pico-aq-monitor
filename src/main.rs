@@ -47,12 +47,13 @@ bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
 });
 
-// WiFi configuration - change these to match your network
-const WIFI_SSID: &str = "YOUR_WIFI_SSID";
-const WIFI_PASSWORD: &str = "YOUR_WIFI_PASSWORD";
+// WiFi and API configuration loaded from .env file at build time
+const WIFI_SSID: &str = env!("WIFI_SSID");
+const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
+const API_ENDPOINT: &str = env!("API_ENDPOINT");
 
-// API endpoint for sensor data submission (dummy URL for now)
-const API_ENDPOINT: &str = "http://192.168.1.100:8080/api/sensors";
+// Network timeouts
+const HTTP_TIMEOUT_SECS: u64 = 10;
 
 #[embassy_executor::task]
 async fn cyw43_task(
@@ -347,11 +348,27 @@ impl SensorPayload {
     }
 }
 
-/// Submit sensor data to API endpoint
-async fn submit_sensor_data(
+/// Network status for tracking connectivity
+#[derive(Clone, Copy, PartialEq)]
+enum NetworkStatus {
+    Connected,
+    Disconnected,
+}
+
+/// Check if network is currently connected
+fn check_network_status(stack: embassy_net::Stack<'static>) -> NetworkStatus {
+    if stack.is_link_up() && stack.config_v4().is_some() {
+        NetworkStatus::Connected
+    } else {
+        NetworkStatus::Disconnected
+    }
+}
+
+/// Internal implementation of HTTP request with timeout
+async fn do_http_request(
     stack: embassy_net::Stack<'static>,
-    payload: &SensorPayload,
-) -> Result<(), &'static str> {
+    json_bytes: &[u8],
+) -> Result<u16, &'static str> {
     let mut rx_buffer = [0; 1024];
 
     let client_state = TcpClientState::<1, 1024, 1024>::new();
@@ -359,11 +376,6 @@ async fn submit_sensor_data(
     let dns_client = DnsSocket::new(stack);
 
     let mut http_client = HttpClient::new(&tcp_client, &dns_client);
-
-    let json = payload.to_json();
-    let json_bytes = json.as_bytes();
-
-    defmt::debug!("Submitting to API: {}", json.as_str());
 
     let request = http_client
         .request(Method::POST, API_ENDPOINT)
@@ -378,15 +390,53 @@ async fn submit_sensor_data(
         .await
         .map_err(|_| "Failed to send HTTP request")?;
 
-    let status = response.status.0;
-    if status >= 200 && status < 300 {
-        defmt::info!("API submission successful (status {})", status);
-        log::info!("API submission successful (status {})", status);
-        Ok(())
-    } else {
-        defmt::warn!("API submission failed (status {})", status);
-        log::warn!("API submission failed (status {})", status);
-        Err("API returned error status")
+    Ok(response.status.0)
+}
+
+/// Submit sensor data to API endpoint with timeout
+async fn submit_sensor_data(
+    stack: embassy_net::Stack<'static>,
+    payload: &SensorPayload,
+) -> Result<(), &'static str> {
+    // Check network status first
+    if check_network_status(stack) == NetworkStatus::Disconnected {
+        return Err("Network disconnected");
+    }
+
+    let json = payload.to_json();
+    let json_bytes = json.as_bytes();
+
+    defmt::debug!("Submitting to API: {}", json.as_str());
+
+    // Apply timeout to the entire HTTP operation
+    let timeout_duration = Duration::from_secs(HTTP_TIMEOUT_SECS);
+    let result = embassy_time::with_timeout(
+        timeout_duration,
+        do_http_request(stack, json_bytes),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(status)) if status >= 200 && status < 300 => {
+            defmt::info!("API submission successful (status {})", status);
+            log::info!("API submission successful (status {})", status);
+            Ok(())
+        }
+        Ok(Ok(status)) => {
+            defmt::warn!("API submission failed (status {})", status);
+            log::warn!("API submission failed (status {})", status);
+            Err("API returned error status")
+        }
+        Ok(Err(e)) => {
+            defmt::warn!("HTTP request failed: {}", e);
+            log::warn!("HTTP request failed: {}", e);
+            Err(e)
+        }
+        Err(_) => {
+            defmt::warn!("HTTP request timed out after {} seconds", HTTP_TIMEOUT_SECS);
+            log::warn!("HTTP request timed out after {} seconds", HTTP_TIMEOUT_SECS);
+            Err("Request timed out")
+        }
     }
 }
 
@@ -559,6 +609,10 @@ async fn main(spawner: Spawner) {
     defmt::info!("Warmup complete - starting continuous readings");
     log::info!("Warmup complete - starting continuous readings");
 
+    // Track network status for reconnection
+    let mut consecutive_network_failures: u8 = 0;
+    const MAX_FAILURES_BEFORE_RECONNECT: u8 = 3;
+
     // Main sensor reading loop
     loop {
         // Indicate reading with LED
@@ -607,6 +661,54 @@ async fn main(spawner: Spawner) {
             }
         }
 
+        // Check network status and attempt reconnection if needed
+        if check_network_status(stack) == NetworkStatus::Disconnected {
+            defmt::warn!("Network disconnected, attempting to reconnect...");
+            log::warn!("Network disconnected, attempting to reconnect...");
+
+            // Attempt to rejoin WiFi
+            match control.join(WIFI_SSID, JoinOptions::new(WIFI_PASSWORD.as_bytes())).await {
+                Ok(()) => {
+                    defmt::info!("WiFi rejoined, waiting for link...");
+                    log::info!("WiFi rejoined, waiting for link...");
+
+                    // Wait for link with timeout
+                    let link_timeout = embassy_time::with_timeout(
+                        Duration::from_secs(10),
+                        stack.wait_link_up(),
+                    )
+                    .await;
+
+                    if link_timeout.is_ok() {
+                        // Wait for DHCP with timeout
+                        let dhcp_timeout = embassy_time::with_timeout(
+                            Duration::from_secs(15),
+                            stack.wait_config_up(),
+                        )
+                        .await;
+
+                        if dhcp_timeout.is_ok() {
+                            if let Some(config) = stack.config_v4() {
+                                defmt::info!("Reconnected with IP: {}", Debug2Format(&config.address));
+                                log::info!("Reconnected with IP: {:?}", config.address);
+                            }
+                            consecutive_network_failures = 0;
+                        } else {
+                            defmt::warn!("DHCP timeout during reconnection");
+                            log::warn!("DHCP timeout during reconnection");
+                        }
+                    } else {
+                        defmt::warn!("Link timeout during reconnection");
+                        log::warn!("Link timeout during reconnection");
+                    }
+                }
+                Err(e) => {
+                    defmt::warn!("WiFi rejoin failed: {}", Debug2Format(&e));
+                    log::warn!("WiFi rejoin failed, will retry next cycle");
+                }
+            }
+        }
+
         // Submit data to API if both readings are available
         if let (Some(env), Some(aq)) = (&env_readings, &aq_readings) {
             let payload = SensorPayload::new(env, aq);
@@ -614,10 +716,24 @@ async fn main(spawner: Spawner) {
             match submit_sensor_data(stack, &payload).await {
                 Ok(()) => {
                     defmt::debug!("Data submitted to API");
+                    consecutive_network_failures = 0;
                 }
                 Err(e) => {
                     defmt::warn!("API submission failed: {}", e);
                     log::warn!("API submission failed: {}", e);
+
+                    consecutive_network_failures = consecutive_network_failures.saturating_add(1);
+
+                    if consecutive_network_failures >= MAX_FAILURES_BEFORE_RECONNECT {
+                        defmt::warn!(
+                            "Multiple consecutive failures ({}), will check network next cycle",
+                            consecutive_network_failures
+                        );
+                        log::warn!(
+                            "Multiple consecutive failures ({}), will check network next cycle",
+                            consecutive_network_failures
+                        );
+                    }
                 }
             }
         }

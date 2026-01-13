@@ -47,5 +47,8 @@ embedded-hal-async = "1.0"
 static_cell = "2.1"
 portable-atomic = { version = "1.5", features = ["critical-section"] }
 
+[build-dependencies]
+dotenvy = "0.15"
+
 [profile.release]
 debug = true

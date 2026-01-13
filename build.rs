@@ -7,6 +7,8 @@
 //! Cargo re-run the build script whenever `memory.x` is changed,
 //! updating `memory.x` ensures a rebuild of the application with the
 //! new memory settings.
+//!
+//! This script also loads WiFi and API configuration from a `.env` file.
 
 use std::env;
 use std::fs::File;
@@ -14,6 +16,35 @@ use std::io::Write;
 use std::path::PathBuf;
 
 fn main() {
+    // Load environment variables from .env file
+    println!("cargo:rerun-if-changed=.env");
+
+    if let Ok(env_path) = dotenvy::dotenv() {
+        println!("cargo:warning=Loaded config from {:?}", env_path);
+    } else {
+        println!("cargo:warning=No .env file found, using environment variables");
+    }
+
+    // Pass WiFi configuration to the compiler
+    if let Ok(ssid) = env::var("WIFI_SSID") {
+        println!("cargo:rustc-env=WIFI_SSID={}", ssid);
+    } else {
+        panic!("WIFI_SSID not set in .env file or environment");
+    }
+
+    if let Ok(password) = env::var("WIFI_PASSWORD") {
+        println!("cargo:rustc-env=WIFI_PASSWORD={}", password);
+    } else {
+        panic!("WIFI_PASSWORD not set in .env file or environment");
+    }
+
+    // Pass API configuration to the compiler
+    if let Ok(endpoint) = env::var("API_ENDPOINT") {
+        println!("cargo:rustc-env=API_ENDPOINT={}", endpoint);
+    } else {
+        panic!("API_ENDPOINT not set in .env file or environment");
+    }
+
     // Put `memory.x` in our output directory and ensure it's
     // on the linker search path.
     let out = &PathBuf::from(env::var_os("OUT_DIR").unwrap());

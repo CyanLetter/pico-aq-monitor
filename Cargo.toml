@@ -15,10 +15,19 @@ embassy-rp = { version = "0.9.0", features = ["defmt", "unstable-pac", "time-dri
 embassy-usb = { version = "0.5.1", features = ["defmt"] }
 embassy-usb-logger = "0.5.1"
 
-# CYW43 WiFi chip (for Pico W onboard LED)
+# CYW43 WiFi chip (for Pico W LED and networking)
 cyw43 = { version = "0.6.0", features = ["defmt", "firmware-logs"] }
 cyw43-pio = { version = "0.9.0", features = ["defmt"] }
 cyw43-firmware = { version = "0.1.0", features = ["wifi"] }
+
+# Networking
+embassy-net = { version = "0.8.0", features = ["defmt", "tcp", "dhcpv4", "medium-ethernet", "dns"] }
+embassy-futures = "0.1.2"
+reqwless = { version = "0.14", default-features = false, features = ["defmt"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde-json-core = "0.6"
+embedded-io-async = { version = "0.7.0", features = ["defmt"] }
+heapless = "0.8"
 
 # Sensor drivers
 ens160-aq = { version = "0.2.11", default-features = false, features = ["async"] }

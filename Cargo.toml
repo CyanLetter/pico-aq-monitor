@@ -20,8 +20,9 @@ cyw43 = { version = "0.6.0", features = ["defmt", "firmware-logs"] }
 cyw43-pio = { version = "0.9.0", features = ["defmt"] }
 cyw43-firmware = { version = "0.1.0", features = ["wifi"] }
 
-# Sensor driver
+# Sensor drivers
 ens160-aq = { version = "0.2.11", default-features = false, features = ["async"] }
+bme280-rs = "0.3"
 
 # Logging
 defmt = "1.0.1"

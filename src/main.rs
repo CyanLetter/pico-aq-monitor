@@ -1,11 +1,13 @@
-//! ENS160 Air Quality Sensor for RP Pico W
+//! ENS160 Air Quality Sensor with BME280 Compensation for RP Pico W
 //!
-//! Reads raw air quality data from an ENS160 sensor over I2C and logs it via RTT.
-//! Use a debug probe (like probe-rs) to view the logs.
+//! Reads air quality data from an ENS160 sensor and uses BME280 temperature/humidity
+//! readings to improve accuracy through environmental compensation.
+//! Logs via USB serial and RTT (for debug probe).
 
 #![no_std]
 #![no_main]
 
+use bme280_rs::{AsyncBme280, Configuration, Oversampling, SensorMode};
 use cyw43_firmware::{CYW43_43439A0 as FIRMWARE, CYW43_43439A0_CLM as CLM};
 use cyw43_pio::{DEFAULT_CLOCK_DIVIDER, PioSpi};
 use defmt::Debug2Format;
@@ -63,8 +65,17 @@ async fn logger_task(driver: Driver<'static, USB>) {
 /// I2C bus type alias
 type I2c0Bus = Mutex<NoopRawMutex, I2c<'static, I2C0, Async>>;
 
+/// I2C device type alias (for shared bus access)
+type I2cDev = I2cDevice<'static, NoopRawMutex, I2c<'static, I2C0, Async>>;
+
 /// ENS160 device type alias
-type Ens160Device = Ens160<I2cDevice<'static, NoopRawMutex, I2c<'static, I2C0, Async>>, Delay>;
+type Ens160Device = Ens160<I2cDev, Delay>;
+
+/// BME280 device type alias
+type Bme280Device = AsyncBme280<I2cDev, Delay>;
+
+/// BME280 I2C address (secondary address 0x77)
+const BME280_ADDRESS: u8 = 0x77;
 
 /// Warmup time for ENS160 sensor in seconds
 const WARMUP_TIME: u64 = 180;
@@ -99,6 +110,14 @@ async fn scan_i2c_bus(i2c: &mut I2c<'static, I2C0, Async>) {
         defmt::info!("Found {} device(s)", found_count);
         log::info!("Found {} device(s)", found_count);
     }
+}
+
+/// Struct to hold BME280 environment readings
+struct EnvironmentReadings {
+    temperature_c: f32,
+    temperature_f: f32,
+    humidity_percent: f32,
+    pressure_hpa: f32,
 }
 
 /// Struct to hold ENS160 sensor readings
@@ -148,6 +167,64 @@ async fn initialize_ens160(
     }
 
     Some(ens160)
+}
+
+/// Initialize the BME280 sensor
+async fn initialize_bme280(i2c_device: I2cDev) -> Option<Bme280Device> {
+    let mut bme280 = AsyncBme280::new_with_address(i2c_device, BME280_ADDRESS, Delay);
+
+    if let Err(e) = bme280.init().await {
+        defmt::error!("Failed to initialize BME280: {}", Debug2Format(&e));
+        log::error!("Failed to initialize BME280: {:?}", e);
+        return None;
+    }
+    defmt::info!("BME280 initialized successfully");
+    log::info!("BME280 initialized successfully");
+
+    // Configure sampling for temperature, humidity, and pressure
+    let config = Configuration::default()
+        .with_temperature_oversampling(Oversampling::Oversample1)
+        .with_humidity_oversampling(Oversampling::Oversample1)
+        .with_pressure_oversampling(Oversampling::Oversample1)
+        .with_sensor_mode(SensorMode::Normal);
+
+    if let Err(e) = bme280.set_sampling_configuration(config).await {
+        defmt::error!("Failed to configure BME280: {}", Debug2Format(&e));
+        log::error!("Failed to configure BME280: {:?}", e);
+        return None;
+    }
+    defmt::info!("BME280 configured successfully");
+    log::info!("BME280 configured successfully");
+
+    Some(bme280)
+}
+
+/// Read environment data from BME280 sensor
+async fn read_bme280(bme280: &mut Bme280Device) -> Result<EnvironmentReadings, &'static str> {
+    let temperature = bme280
+        .read_temperature()
+        .await
+        .map_err(|_| "Failed to read BME280 temperature")?
+        .ok_or("BME280 temperature not available")?;
+
+    let humidity = bme280
+        .read_humidity()
+        .await
+        .map_err(|_| "Failed to read BME280 humidity")?
+        .ok_or("BME280 humidity not available")?;
+
+    let pressure = bme280
+        .read_pressure()
+        .await
+        .map_err(|_| "Failed to read BME280 pressure")?
+        .ok_or("BME280 pressure not available")?;
+
+    Ok(EnvironmentReadings {
+        temperature_c: temperature,
+        temperature_f: (temperature * 1.8) + 32.0,
+        humidity_percent: humidity,
+        pressure_hpa: pressure / 100.0, // Convert Pa to hPa
+    })
 }
 
 /// Read raw data from ENS160 sensor (single reading, no median)
@@ -247,13 +324,13 @@ async fn main(spawner: Spawner) {
         .set_power_management(cyw43::PowerManagementMode::PowerSave)
         .await;
 
-    // Initialize I2C bus for ENS160 sensor
+    // Initialize I2C bus for sensors
     // Using GPIO4 (SDA) and GPIO5 (SCL) - adjust pins as needed for your wiring
     let sda = p.PIN_4;
     let scl = p.PIN_5;
     let mut i2c = I2c::new_async(p.I2C0, scl, sda, Irqs, I2cConfig::default());
 
-    // Wait for sensor to power up before scanning
+    // Wait for sensors to power up before scanning
     defmt::info!("Waiting for I2C devices to power up...");
     log::info!("Waiting for I2C devices to power up...");
     Timer::after(Duration::from_millis(2000)).await;
@@ -265,11 +342,28 @@ async fn main(spawner: Spawner) {
     static I2C_BUS: StaticCell<I2c0Bus> = StaticCell::new();
     let i2c_bus = I2C_BUS.init(Mutex::new(i2c));
 
-    // Create I2C device for ENS160
+    // Create I2C devices for both sensors (shared bus)
     let ens160_i2c = I2cDevice::new(i2c_bus);
+    let bme280_i2c = I2cDevice::new(i2c_bus);
 
     // ENS160 interrupt pin - adjust as needed for your wiring
     let mut ens160_int = Input::new(p.PIN_6, Pull::Up);
+
+    // Initialize BME280 first (for environmental compensation)
+    let mut bme280 = match initialize_bme280(bme280_i2c).await {
+        Some(sensor) => sensor,
+        None => {
+            defmt::error!("Failed to initialize BME280 - halting");
+            log::error!("Failed to initialize BME280 - halting");
+            loop {
+                // Blink LED rapidly to indicate error
+                control.gpio_set(0, true).await;
+                Timer::after(Duration::from_millis(100)).await;
+                control.gpio_set(0, false).await;
+                Timer::after(Duration::from_millis(100)).await;
+            }
+        }
+    };
 
     // Initialize ENS160
     let mut ens160 = match initialize_ens160(ens160_i2c).await {
@@ -313,13 +407,39 @@ async fn main(spawner: Spawner) {
         // Indicate reading with LED
         control.gpio_set(0, true).await;
 
+        // Read BME280 for environmental data
+        match read_bme280(&mut bme280).await {
+            Ok(env) => {
+                defmt::info!(
+                    "Environment: {} F, {}% RH, {} hPa",
+                    env.temperature_f, env.humidity_percent, env.pressure_hpa
+                );
+                log::info!(
+                    "Environment: {:.1} F, {:.1}% RH, {:.1} hPa",
+                    env.temperature_f, env.humidity_percent, env.pressure_hpa
+                );
+
+                // Apply temperature and humidity compensation to ENS160
+                let humidity_int = env.humidity_percent as u16;
+                if let Err(e) = ens160.set_temp_rh_comp(env.temperature_c, humidity_int).await {
+                    defmt::warn!("Failed to set ENS160 compensation: {}", Debug2Format(&e));
+                    log::warn!("Failed to set ENS160 compensation: {:?}", e);
+                }
+            }
+            Err(e) => {
+                defmt::warn!("BME280 read failed: {}", e);
+                log::warn!("BME280 read failed: {}", e);
+            }
+        }
+
+        // Read ENS160 air quality data
         match read_ens160(&mut ens160, &mut ens160_int).await {
             Ok(_readings) => {
                 defmt::debug!("Sensor read successful");
             }
             Err(e) => {
-                defmt::error!("Sensor read failed: {}", e);
-                log::error!("Sensor read failed: {}", e);
+                defmt::error!("ENS160 read failed: {}", e);
+                log::error!("ENS160 read failed: {}", e);
             }
         }
 

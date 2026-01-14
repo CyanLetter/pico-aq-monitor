@@ -37,6 +37,13 @@ cargo run --release
 
 ## Viewing Output
 
+Logs can be viewed by default with a debug probe. An optional feature flag allows USB debugging.
+
+```bash
+# Build and flash with USB debugging enabled
+cargo run --release --features usb-logging
+```
+
 Connect to USB serial to see sensor readings:
 
 ```bash
@@ -53,7 +60,6 @@ After a 3-minute warmup period, the sensor outputs every 5 seconds:
 - **AQI**: Air Quality Index (1-5)
 - **eCO2**: Equivalent CO2 in ppm
 - **TVOC**: Total Volatile Organic Compounds in ppb
-- **Ethanol**: Ethanol concentration in ppb
 
 ## LED Behavior
 
@@ -63,4 +69,4 @@ After a 3-minute warmup period, the sensor outputs every 5 seconds:
 
 ## License
 
-MIT OR Apache-2.0
+MIT

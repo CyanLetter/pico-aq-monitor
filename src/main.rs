@@ -51,6 +51,7 @@ bind_interrupts!(struct Irqs {
 const WIFI_SSID: &str = env!("WIFI_SSID");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 const API_ENDPOINT: &str = env!("API_ENDPOINT");
+const API_KEY: &str = env!("API_KEY");
 
 // Network timeouts
 const HTTP_TIMEOUT_SECS: u64 = 10;
@@ -243,8 +244,8 @@ async fn read_bme280(bme280: &mut Bme280Device) -> Result<EnvironmentReadings, &
         .ok_or("BME280 pressure not available")?;
 
     Ok(EnvironmentReadings {
-        temperature_c: temperature,
-        temperature_f: (temperature * 1.8) + 32.0,
+        temperature_c: temperature - 3.3, // This board temp sensor runs high due to being close to the gas sensor heater - adjust for this
+        temperature_f: (temperature * 1.8) + (32.0 - 6.0),
         humidity_percent: humidity,
         pressure_hpa: pressure / 100.0, // Convert Pa to hPa
     })
@@ -382,7 +383,7 @@ async fn do_http_request(
         .await
         .map_err(|_| "Failed to create HTTP request")?;
 
-    let headers = [("Content-Type", "application/json")];
+    let headers = [("Content-Type", "application/json"),("X-API-Key", API_KEY)];
     let mut request = request.headers(&headers).body(json_bytes);
 
     let response = request

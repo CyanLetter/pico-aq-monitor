@@ -45,6 +45,12 @@ fn main() {
         panic!("API_ENDPOINT not set in .env file or environment");
     }
 
+    if let Ok(key) = env::var("API_KEY") {
+        println!("cargo:rustc-env=API_KEY={}", key);
+    } else {
+        panic!("API_KEY not set in .env file or environment");
+    }
+
     // Put `memory.x` in our output directory and ensure it's
     // on the linker search path.
     let out = &PathBuf::from(env::var_os("OUT_DIR").unwrap());

@@ -147,7 +147,6 @@ struct EnvironmentReadings {
 /// Struct to hold ENS160 sensor readings
 struct Ens160Readings {
     eco2: u16,
-    etoh: u16,
     tvoc: u16,
     aqi: u8,
 }
@@ -271,11 +270,6 @@ async fn read_ens160(
         .await
         .map_err(|_| "Failed to get eCO2")?;
 
-    let etoh = ens160
-        .get_etoh()
-        .await
-        .map_err(|_| "Failed to get ethanol")?;
-
     let tvoc = ens160
         .get_tvoc()
         .await
@@ -288,18 +282,17 @@ async fn read_ens160(
 
     let readings = Ens160Readings {
         eco2: eco2.get_value(),
-        etoh,
         tvoc,
         aqi: aqi as u8,
     };
 
     defmt::info!(
-        "AQI: {}, eCO2: {} ppm, Ethanol: {} ppb, VOCs: {} ppb",
-        readings.aqi, readings.eco2, readings.etoh, readings.tvoc
+        "AQI: {}, eCO2: {} ppm, VOCs: {} ppb",
+        readings.aqi, readings.eco2, readings.tvoc
     );
     log::info!(
-        "AQI: {}, eCO2: {} ppm, Ethanol: {} ppb, VOCs: {} ppb",
-        readings.aqi, readings.eco2, readings.etoh, readings.tvoc
+        "AQI: {}, eCO2: {} ppm, VOCs: {} ppb",
+        readings.aqi, readings.eco2, readings.tvoc
     );
 
     Ok(readings)

@@ -24,6 +24,8 @@ The SparkFun board uses I2C address `0x53` (ADDR jumper set high). If your board
 
 ## Building
 
+Currently configured to build and flash over USB. Future version will be updated to use `probe-rs` instead.
+
 ```bash
 # Install required tools
 cargo install elf2uf2-rs
@@ -66,6 +68,8 @@ After a 3-minute warmup period, the sensor outputs every 5 seconds:
 - **Slow blink (200ms on, 800ms off)**: Warmup period
 - **Brief flash**: Reading sensor
 - **Rapid blink**: Error state
+
+LED code is specific to the Pico W LED, which is controlled via the wireless chip rather than a GPIO pin.
 
 ## License
 

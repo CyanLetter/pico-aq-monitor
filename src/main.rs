@@ -8,6 +8,13 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use embedded_alloc::LlffHeap as Heap;
+
+#[global_allocator]
+static HEAP: Heap = Heap::empty();
+
 use bme280_rs::{AsyncBme280, Configuration, Oversampling, SensorMode};
 use core::fmt::Write as _;
 use cyw43::JoinOptions;
@@ -37,7 +44,7 @@ use embassy_usb_logger::ReceiverHandler;
 use ens160_aq::data::InterruptPinConfig;
 use ens160_aq::Ens160;
 use heapless::String;
-use reqwless::client::HttpClient;
+use reqwless::client::{HttpClient, TlsConfig, TlsVerify};
 use reqwless::request::{Method, RequestBuilder};
 use static_cell::StaticCell;
 
@@ -120,7 +127,7 @@ const BME280_ADDRESS: u8 = 0x77;
 const WARMUP_TIME: u64 = 180;
 
 /// Read interval in seconds
-const READ_INTERVAL: u64 = 5;
+const READ_INTERVAL: u64 = 120;
 
 /// Scan I2C bus for devices and log results
 async fn scan_i2c_bus(i2c: &mut I2c<'static, I2C0, Async>) {
@@ -373,31 +380,57 @@ fn check_network_status(stack: embassy_net::Stack<'static>) -> NetworkStatus {
     }
 }
 
-/// Internal implementation of HTTP request with timeout
+/// Internal implementation of HTTP request with TLS support
 async fn do_http_request(
     stack: embassy_net::Stack<'static>,
     json_bytes: &[u8],
+    rng: &mut RoscRng,
 ) -> Result<u16, &'static str> {
-    let mut rx_buffer = [0; 1024];
+    let mut rx_buffer = [0; 4096];
+    let mut tls_read_buffer = [0; 16384];
+    let mut tls_write_buffer = [0; 4096];
 
-    let client_state = TcpClientState::<1, 1024, 1024>::new();
+    let client_state = TcpClientState::<1, 4096, 4096>::new();
     let tcp_client = TcpClient::new(stack, &client_state);
     let dns_client = DnsSocket::new(stack);
 
-    let mut http_client = HttpClient::new(&tcp_client, &dns_client);
+    // Configure TLS (skip certificate verification for embedded device)
+    let seed = rng.next_u64();
+    let tls_config = TlsConfig::new(
+        seed,
+        &mut tls_read_buffer,
+        &mut tls_write_buffer,
+        TlsVerify::None,
+    );
 
-    let request = http_client
-        .request(Method::POST, API_ENDPOINT)
-        .await
-        .map_err(|_| "Failed to create HTTP request")?;
+    let mut http_client = HttpClient::new_with_tls(&tcp_client, &dns_client, tls_config);
 
-    let headers = [("Content-Type", "application/json"),("X-API-Key", API_KEY)];
+    defmt::info!("Creating request for endpoint: {}", API_ENDPOINT);
+    log::info!("Creating request for endpoint: {}", API_ENDPOINT);
+
+    let request = match http_client.request(Method::POST, API_ENDPOINT).await {
+        Ok(req) => req,
+        Err(e) => {
+            defmt::error!("Failed to create HTTP request: {}", Debug2Format(&e));
+            log::error!("Failed to create HTTP request: {:?}", e);
+            return Err("Failed to create HTTP request");
+        }
+    };
+
+    defmt::info!("Request created, sending...");
+    log::info!("Request created, sending...");
+
+    let headers = [("Content-Type", "application/json"), ("X-API-Key", API_KEY)];
     let mut request = request.headers(&headers).body(json_bytes);
 
-    let response = request
-        .send(&mut rx_buffer)
-        .await
-        .map_err(|_| "Failed to send HTTP request")?;
+    let response = match request.send(&mut rx_buffer).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            defmt::error!("Failed to send HTTP request: {}", Debug2Format(&e));
+            log::error!("Failed to send HTTP request: {:?}", e);
+            return Err("Failed to send HTTP request");
+        }
+    };
 
     Ok(response.status.0)
 }
@@ -406,6 +439,7 @@ async fn do_http_request(
 async fn submit_sensor_data(
     stack: embassy_net::Stack<'static>,
     payload: &SensorPayload,
+    rng: &mut RoscRng,
 ) -> Result<(), &'static str> {
     // Check network status first
     if check_network_status(stack) == NetworkStatus::Disconnected {
@@ -421,7 +455,7 @@ async fn submit_sensor_data(
     let timeout_duration = Duration::from_secs(HTTP_TIMEOUT_SECS);
     let result = embassy_time::with_timeout(
         timeout_duration,
-        do_http_request(stack, json_bytes),
+        do_http_request(stack, json_bytes, rng),
     )
     .await;
 
@@ -451,6 +485,16 @@ async fn submit_sensor_data(
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    // Initialize heap for TLS RSA support (32KB)
+    {
+        use core::mem::MaybeUninit;
+
+        const HEAP_SIZE: usize = 32 * 1024;
+        static HEAP_MEM: StaticCell<[MaybeUninit<u8>; HEAP_SIZE]> = StaticCell::new();
+        let heap_mem = HEAP_MEM.init([const { MaybeUninit::uninit() }; HEAP_SIZE]);
+        unsafe { HEAP.init(heap_mem.as_ptr() as usize, HEAP_SIZE) }
+    }
+
     let p = embassy_rp::init(Default::default());
 
     // Initialize random number generator for network stack
@@ -724,7 +768,7 @@ async fn main(spawner: Spawner) {
         if let (Some(env), Some(aq)) = (&env_readings, &aq_readings) {
             let payload = SensorPayload::new(env, aq);
 
-            match submit_sensor_data(stack, &payload).await {
+            match submit_sensor_data(stack, &payload, &mut rng).await {
                 Ok(()) => {
                     defmt::debug!("Data submitted to API");
                     consecutive_network_failures = 0;

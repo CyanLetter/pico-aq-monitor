@@ -2,3 +2,6 @@
 
 # Environment file with secrets (use .env.example as template)
 .env
+.env.local
+.env.dev
+.env.prod

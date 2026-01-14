@@ -28,7 +28,9 @@ cyw43-firmware = { version = "0.1.0", features = ["wifi"] }
 # Networking
 embassy-net = { version = "0.8.0", features = ["defmt", "tcp", "dhcpv4", "medium-ethernet", "dns"] }
 embassy-futures = "0.1.2"
-reqwless = { version = "0.14", default-features = false, features = ["defmt"] }
+reqwless = { version = "0.14", default-features = false, features = ["defmt", "embedded-tls"] }
+embedded-tls = { version = "0.18", default-features = false, features = ["defmt", "alloc"] }
+embedded-alloc = "0.6"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde-json-core = "0.6"
 embedded-io-async = { version = "0.7.0", features = ["defmt"] }

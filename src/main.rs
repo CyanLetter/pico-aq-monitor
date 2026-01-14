@@ -23,12 +23,16 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::i2c::{Async, Config as I2cConfig, I2c, InterruptHandler as I2cInterruptHandler};
-use embassy_rp::peripherals::{DMA_CH0, I2C0, PIO0, USB};
+use embassy_rp::peripherals::{DMA_CH0, I2C0, PIO0};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
+#[cfg(feature = "usb-logging")]
+use embassy_rp::peripherals::USB;
+#[cfg(feature = "usb-logging")]
 use embassy_rp::usb::Driver;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Delay, Duration, Timer};
+#[cfg(feature = "usb-logging")]
 use embassy_usb_logger::ReceiverHandler;
 use ens160_aq::data::InterruptPinConfig;
 use ens160_aq::Ens160;
@@ -39,12 +43,20 @@ use static_cell::StaticCell;
 
 use {defmt_rtt as _, panic_probe as _};
 
+#[cfg(feature = "usb-logging")]
 use embassy_rp::usb::InterruptHandler as UsbInterruptHandler;
 
+#[cfg(feature = "usb-logging")]
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
     I2C0_IRQ => I2cInterruptHandler<I2C0>;
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
+});
+
+#[cfg(not(feature = "usb-logging"))]
+bind_interrupts!(struct Irqs {
+    PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
+    I2C0_IRQ => I2cInterruptHandler<I2C0>;
 });
 
 // WiFi and API configuration loaded from .env file at build time
@@ -68,9 +80,11 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
     runner.run().await
 }
 
-/// USB serial logger task
+/// USB serial logger task (only compiled when usb-logging feature is enabled)
+#[cfg(feature = "usb-logging")]
 struct Handler;
 
+#[cfg(feature = "usb-logging")]
 impl ReceiverHandler for Handler {
     fn new() -> Self {
         Handler
@@ -81,6 +95,7 @@ impl ReceiverHandler for Handler {
     }
 }
 
+#[cfg(feature = "usb-logging")]
 #[embassy_executor::task]
 async fn logger_task(driver: Driver<'static, USB>) {
     embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver, Handler);
@@ -441,12 +456,14 @@ async fn main(spawner: Spawner) {
     // Initialize random number generator for network stack
     let mut rng = RoscRng;
 
-    // Initialize USB serial logger
-    let usb_driver = Driver::new(p.USB, Irqs);
-    spawner.spawn(logger_task(usb_driver)).unwrap();
-
-    // Give USB time to enumerate before logging
-    Timer::after(Duration::from_millis(100)).await;
+    // Initialize USB serial logger (only when usb-logging feature is enabled)
+    #[cfg(feature = "usb-logging")]
+    {
+        let usb_driver = Driver::new(p.USB, Irqs);
+        spawner.spawn(logger_task(usb_driver)).unwrap();
+        // Give USB time to enumerate before logging
+        Timer::after(Duration::from_millis(100)).await;
+    }
 
     defmt::info!("ENS160 Air Quality Sensor with WiFi starting...");
     log::info!("ENS160 Air Quality Sensor with WiFi starting...");

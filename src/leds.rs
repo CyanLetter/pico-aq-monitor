@@ -55,11 +55,14 @@ fn co2_to_color(co2_ppm: u16) -> RGB8 {
 /// Scale a color by a brightness factor (0.0 to 1.0)
 fn scale_color(color: RGB8, brightness: f32) -> RGB8 {
     let brightness = brightness.clamp(0.0, 1.0);
-    RGB8::new(
+    // defmt::info!("Brightness is {}", brightness);
+    let newColor = RGB8::new(
         (color.r as f32 * brightness) as u8,
         (color.g as f32 * brightness) as u8,
         (color.b as f32 * brightness) as u8,
-    )
+    );
+    // defmt::info!("R: {} G: {} B: {}", newColor.r, newColor.g, newColor.b);
+    return newColor;
 }
 
 /// Calculate pulsing brightness for a single LED in the sequence.
@@ -77,7 +80,7 @@ fn pulse_brightness(
     let phase_offset = (led_index as f32 / NUM_LEDS as f32) * core::f32::consts::PI * 2.0;
 
     // Sinusoidal pulse
-    let sin_value = sinf(time * wave_speed + phase_offset);
+    let sin_value = sinf(time * wave_speed - phase_offset);
 
     // Map from [-1, 1] to [min_brightness, max_brightness]
     let normalized = (sin_value + 1.0) / 2.0;
@@ -129,9 +132,9 @@ impl<'d> LedController<'d> {
         let mut led_colors = [RGB8::default(); NUM_LEDS];
 
         // Animation parameters
-        const WAVE_SPEED: f32 = 1.5; // Slow, gentle pulse
-        const MIN_BRIGHTNESS: f32 = 0.2;
-        const MAX_BRIGHTNESS: f32 = 1.0;
+        const WAVE_SPEED: f32 = 8.0; // Slow, gentle pulse
+        const MIN_BRIGHTNESS: f32 = 0.01;
+        const MAX_BRIGHTNESS: f32 = 0.2;
 
         for i in 0..NUM_LEDS {
             let brightness = pulse_brightness(
@@ -143,6 +146,8 @@ impl<'d> LedController<'d> {
             );
             led_colors[i] = scale_color(base_color, brightness);
         }
+
+        // defmt::info!("R: {} G: {} B: {}", led_colors[0].r, led_colors[0].g, led_colors[0].b);
 
         self.ws.write(&led_colors).await;
     }

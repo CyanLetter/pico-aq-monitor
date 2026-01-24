@@ -1,9 +1,9 @@
 [package]
-name = "ens160-air-quality"
+name = "scd40-air-quality"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "ENS160 air quality sensor on Raspberry Pi Pico W"
+description = "SCD40 CO2 sensor with AHT20/BMP280 on Raspberry Pi Pico W"
 
 [features]
 default = []
@@ -37,8 +37,9 @@ embedded-io-async = { version = "0.7.0", features = ["defmt"] }
 heapless = "0.8"
 
 # Sensor drivers
-ens160-aq = { version = "0.2.11", default-features = false, features = ["async"] }
-bme280-rs = "0.3"
+scd4x = { version = "0.4.1", features = ["embedded-hal-async"] }  # CO2 sensor
+aht20-async = "1.0"  # Temperature/humidity
+bme280-rs = "0.3"  # Reuse for BMP280 pressure readings
 
 # Logging
 defmt = "1.0.1"

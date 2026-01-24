@@ -1,34 +1,34 @@
-//! ENS160 Air Quality Sensor with BME280 Compensation for RP Pico W
+//! SCD40 CO2 Sensor with AHT20/BMP280 for RP Pico W
 //!
-//! Reads air quality data from an ENS160 sensor and uses BME280 temperature/humidity
-//! readings to improve accuracy through environmental compensation.
-//! Submits sensor data to a REST API endpoint over WiFi.
-//! Logs via USB serial and RTT (for debug probe).
+//! Reads CO2 data from an SCD40 sensor, temperature/humidity from AHT20,
+//! and pressure from BMP280. Submits sensor data to a REST API endpoint over WiFi.
+//! Logs via USB serial (optional) and RTT (for debug probe).
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
+mod network;
+mod sensors;
+mod types;
+
 use embedded_alloc::LlffHeap as Heap;
 
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 
-use bme280_rs::{AsyncBme280, Configuration, Oversampling, SensorMode};
-use core::fmt::Write as _;
 use cyw43::JoinOptions;
 use cyw43_firmware::{CYW43_43439A0 as FIRMWARE, CYW43_43439A0_CLM as CLM};
 use cyw43_pio::{DEFAULT_CLOCK_DIVIDER, PioSpi};
 use defmt::Debug2Format;
 use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
 use embassy_executor::Spawner;
-use embassy_net::dns::DnsSocket;
-use embassy_net::tcp::client::{TcpClient, TcpClientState};
-use embassy_net::{Config as NetConfig, StackResources};
+use embassy_net::Config as NetConfig;
+use embassy_net::StackResources;
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
-use embassy_rp::gpio::{Input, Level, Output, Pull};
+use embassy_rp::gpio::{Level, Output};
 use embassy_rp::i2c::{Async, Config as I2cConfig, I2c, InterruptHandler as I2cInterruptHandler};
 use embassy_rp::peripherals::{DMA_CH0, I2C0, PIO0};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
@@ -38,15 +38,14 @@ use embassy_rp::peripherals::USB;
 use embassy_rp::usb::Driver;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_time::{Delay, Duration, Timer};
+use embassy_time::{Duration, Timer};
 #[cfg(feature = "usb-logging")]
 use embassy_usb_logger::ReceiverHandler;
-use ens160_aq::data::InterruptPinConfig;
-use ens160_aq::Ens160;
-use heapless::String;
-use reqwless::client::{HttpClient, TlsConfig, TlsVerify};
-use reqwless::request::{Method, RequestBuilder};
 use static_cell::StaticCell;
+
+use crate::network::{check_network_status, submit_sensor_data};
+use crate::sensors::{Aht20Sensor, Bmp280Sensor, Scd40Sensor};
+use crate::types::{NetworkStatus, SensorPayload, SensorReadings};
 
 use {defmt_rtt as _, panic_probe as _};
 
@@ -66,14 +65,15 @@ bind_interrupts!(struct Irqs {
     I2C0_IRQ => I2cInterruptHandler<I2C0>;
 });
 
-// WiFi and API configuration loaded from .env file at build time
+// WiFi configuration loaded from .env file at build time
 const WIFI_SSID: &str = env!("WIFI_SSID");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
-const API_ENDPOINT: &str = env!("API_ENDPOINT");
-const API_KEY: &str = env!("API_KEY");
 
-// Network timeouts
-const HTTP_TIMEOUT_SECS: u64 = 10;
+/// Warmup time for SCD40 sensor in seconds (faster than ENS160's 180s)
+const WARMUP_TIME: u64 = 60;
+
+/// Read interval in seconds
+const READ_INTERVAL: u64 = 120;
 
 #[embassy_executor::task]
 async fn cyw43_task(
@@ -111,24 +111,6 @@ async fn logger_task(driver: Driver<'static, USB>) {
 /// I2C bus type alias
 type I2c0Bus = Mutex<NoopRawMutex, I2c<'static, I2C0, Async>>;
 
-/// I2C device type alias (for shared bus access)
-type I2cDev = I2cDevice<'static, NoopRawMutex, I2c<'static, I2C0, Async>>;
-
-/// ENS160 device type alias
-type Ens160Device = Ens160<I2cDev, Delay>;
-
-/// BME280 device type alias
-type Bme280Device = AsyncBme280<I2cDev, Delay>;
-
-/// BME280 I2C address (secondary address 0x77)
-const BME280_ADDRESS: u8 = 0x77;
-
-/// Warmup time for ENS160 sensor in seconds
-const WARMUP_TIME: u64 = 180;
-
-/// Read interval in seconds
-const READ_INTERVAL: u64 = 120;
-
 /// Scan I2C bus for devices and log results
 async fn scan_i2c_bus(i2c: &mut I2c<'static, I2C0, Async>) {
     use embedded_hal_async::i2c::I2c as _;
@@ -158,331 +140,6 @@ async fn scan_i2c_bus(i2c: &mut I2c<'static, I2C0, Async>) {
     }
 }
 
-/// Struct to hold BME280 environment readings
-struct EnvironmentReadings {
-    temperature_c: f32,
-    temperature_f: f32,
-    humidity_percent: f32,
-    pressure_hpa: f32,
-}
-
-/// Struct to hold ENS160 sensor readings
-struct Ens160Readings {
-    eco2: u16,
-    tvoc: u16,
-    aqi: u8,
-}
-
-/// Initialize the ENS160 sensor
-async fn initialize_ens160(
-    i2c_device: I2cDevice<'static, NoopRawMutex, I2c<'static, I2C0, Async>>,
-) -> Option<Ens160Device> {
-    // Use secondary address (0x53) for SparkFun board with ADDR jumper set high
-    // Use Ens160::new() instead if your board uses address 0x52
-    let mut ens160 = Ens160::new_secondary_address(i2c_device, Delay);
-
-    if let Err(e) = ens160.initialize().await {
-        defmt::error!("Failed to initialize ENS160: {}", Debug2Format(&e));
-        log::error!("Failed to initialize ENS160: {:?}", e);
-        return None;
-    }
-    defmt::info!("ENS160 initialized successfully");
-    log::info!("ENS160 initialized successfully");
-
-    // Configure interrupt pin for new data notifications
-    match ens160
-        .config_interrupt_pin(
-            InterruptPinConfig::builder()
-                .push_pull()
-                .on_new_data()
-                .enable_interrupt()
-                .build(),
-        )
-        .await
-    {
-        Ok(val) => {
-            defmt::info!("ENS160 interrupt pin configured: {}", val);
-            log::info!("ENS160 interrupt pin configured: {}", val);
-        }
-        Err(e) => {
-            defmt::error!("Failed to configure ENS160 interrupt pin: {}", Debug2Format(&e));
-            log::error!("Failed to configure ENS160 interrupt pin: {:?}", e);
-            return None;
-        }
-    }
-
-    Some(ens160)
-}
-
-/// Initialize the BME280 sensor
-async fn initialize_bme280(i2c_device: I2cDev) -> Option<Bme280Device> {
-    let mut bme280 = AsyncBme280::new_with_address(i2c_device, BME280_ADDRESS, Delay);
-
-    if let Err(e) = bme280.init().await {
-        defmt::error!("Failed to initialize BME280: {}", Debug2Format(&e));
-        log::error!("Failed to initialize BME280: {:?}", e);
-        return None;
-    }
-    defmt::info!("BME280 initialized successfully");
-    log::info!("BME280 initialized successfully");
-
-    // Configure sampling for temperature, humidity, and pressure
-    let config = Configuration::default()
-        .with_temperature_oversampling(Oversampling::Oversample1)
-        .with_humidity_oversampling(Oversampling::Oversample1)
-        .with_pressure_oversampling(Oversampling::Oversample1)
-        .with_sensor_mode(SensorMode::Normal);
-
-    if let Err(e) = bme280.set_sampling_configuration(config).await {
-        defmt::error!("Failed to configure BME280: {}", Debug2Format(&e));
-        log::error!("Failed to configure BME280: {:?}", e);
-        return None;
-    }
-    defmt::info!("BME280 configured successfully");
-    log::info!("BME280 configured successfully");
-
-    Some(bme280)
-}
-
-/// Read environment data from BME280 sensor
-async fn read_bme280(bme280: &mut Bme280Device) -> Result<EnvironmentReadings, &'static str> {
-    let temperature = bme280
-        .read_temperature()
-        .await
-        .map_err(|_| "Failed to read BME280 temperature")?
-        .ok_or("BME280 temperature not available")?;
-
-    let humidity = bme280
-        .read_humidity()
-        .await
-        .map_err(|_| "Failed to read BME280 humidity")?
-        .ok_or("BME280 humidity not available")?;
-
-    let pressure = bme280
-        .read_pressure()
-        .await
-        .map_err(|_| "Failed to read BME280 pressure")?
-        .ok_or("BME280 pressure not available")?;
-
-    Ok(EnvironmentReadings {
-        temperature_c: temperature - 3.3, // This board temp sensor runs high due to being close to the gas sensor heater - adjust for this
-        temperature_f: (temperature * 1.8) + (32.0 - 6.0),
-        humidity_percent: humidity,
-        pressure_hpa: pressure / 100.0, // Convert Pa to hPa
-    })
-}
-
-/// Read raw data from ENS160 sensor (single reading, no median)
-async fn read_ens160(
-    ens160: &mut Ens160Device,
-    int_pin: &mut Input<'static>,
-) -> Result<Ens160Readings, &'static str> {
-    // Wait for interrupt indicating new data is ready
-    int_pin.wait_for_low().await;
-    defmt::debug!("ENS160 interrupt received - data ready");
-
-    let status = ens160
-        .get_status()
-        .await
-        .map_err(|_| "Failed to get ENS160 status")?;
-    defmt::debug!("ENS160 status: {}", Debug2Format(&status));
-
-    let eco2 = ens160
-        .get_eco2()
-        .await
-        .map_err(|_| "Failed to get eCO2")?;
-
-    let tvoc = ens160
-        .get_tvoc()
-        .await
-        .map_err(|_| "Failed to get VOCs")?;
-
-    let aqi = ens160
-        .get_airquality_index()
-        .await
-        .map_err(|_| "Failed to get Air Quality Index")?;
-
-    let readings = Ens160Readings {
-        eco2: eco2.get_value(),
-        tvoc,
-        aqi: aqi as u8,
-    };
-
-    defmt::info!(
-        "AQI: {}, eCO2: {} ppm, VOCs: {} ppb",
-        readings.aqi, readings.eco2, readings.tvoc
-    );
-    log::info!(
-        "AQI: {}, eCO2: {} ppm, VOCs: {} ppb",
-        readings.aqi, readings.eco2, readings.tvoc
-    );
-
-    Ok(readings)
-}
-
-/// Combined sensor data for API submission
-struct SensorPayload {
-    temperature_c: f32,
-    temperature_f: f32,
-    humidity_percent: f32,
-    pressure_hpa: f32,
-    eco2: u16,
-    tvoc: u16,
-    aqi: u8,
-}
-
-impl SensorPayload {
-    /// Create a new sensor payload from environment and air quality readings
-    fn new(env: &EnvironmentReadings, aq: &Ens160Readings) -> Self {
-        Self {
-            temperature_c: env.temperature_c,
-            temperature_f: env.temperature_f,
-            humidity_percent: env.humidity_percent,
-            pressure_hpa: env.pressure_hpa,
-            eco2: aq.eco2,
-            tvoc: aq.tvoc,
-            aqi: aq.aqi,
-        }
-    }
-
-    /// Serialize payload to JSON string
-    fn to_json(&self) -> String<512> {
-        let mut json: String<512> = String::new();
-        // Manual JSON construction (no_std compatible)
-        let _ = write!(
-            json,
-            r#"{{"temperature_c":{:.2},"temperature_f":{:.2},"humidity_percent":{:.2},"pressure_hpa":{:.2},"eco2":{},"tvoc":{},"aqi":{}}}"#,
-            self.temperature_c,
-            self.temperature_f,
-            self.humidity_percent,
-            self.pressure_hpa,
-            self.eco2,
-            self.tvoc,
-            self.aqi
-        );
-        json
-    }
-}
-
-/// Network status for tracking connectivity
-#[derive(Clone, Copy, PartialEq)]
-enum NetworkStatus {
-    Connected,
-    Disconnected,
-}
-
-/// Check if network is currently connected
-fn check_network_status(stack: embassy_net::Stack<'static>) -> NetworkStatus {
-    if stack.is_link_up() && stack.config_v4().is_some() {
-        NetworkStatus::Connected
-    } else {
-        NetworkStatus::Disconnected
-    }
-}
-
-/// Internal implementation of HTTP request with TLS support
-async fn do_http_request(
-    stack: embassy_net::Stack<'static>,
-    json_bytes: &[u8],
-    rng: &mut RoscRng,
-) -> Result<u16, &'static str> {
-    let mut rx_buffer = [0; 4096];
-    let mut tls_read_buffer = [0; 16384];
-    let mut tls_write_buffer = [0; 4096];
-
-    let client_state = TcpClientState::<1, 4096, 4096>::new();
-    let tcp_client = TcpClient::new(stack, &client_state);
-    let dns_client = DnsSocket::new(stack);
-
-    // Configure TLS (skip certificate verification for embedded device)
-    let seed = rng.next_u64();
-    let tls_config = TlsConfig::new(
-        seed,
-        &mut tls_read_buffer,
-        &mut tls_write_buffer,
-        TlsVerify::None,
-    );
-
-    let mut http_client = HttpClient::new_with_tls(&tcp_client, &dns_client, tls_config);
-
-    defmt::info!("Creating request for endpoint: {}", API_ENDPOINT);
-    log::info!("Creating request for endpoint: {}", API_ENDPOINT);
-
-    let request = match http_client.request(Method::POST, API_ENDPOINT).await {
-        Ok(req) => req,
-        Err(e) => {
-            defmt::error!("Failed to create HTTP request: {}", Debug2Format(&e));
-            log::error!("Failed to create HTTP request: {:?}", e);
-            return Err("Failed to create HTTP request");
-        }
-    };
-
-    defmt::info!("Request created, sending...");
-    log::info!("Request created, sending...");
-
-    let headers = [("Content-Type", "application/json"), ("X-API-Key", API_KEY)];
-    let mut request = request.headers(&headers).body(json_bytes);
-
-    let response = match request.send(&mut rx_buffer).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            defmt::error!("Failed to send HTTP request: {}", Debug2Format(&e));
-            log::error!("Failed to send HTTP request: {:?}", e);
-            return Err("Failed to send HTTP request");
-        }
-    };
-
-    Ok(response.status.0)
-}
-
-/// Submit sensor data to API endpoint with timeout
-async fn submit_sensor_data(
-    stack: embassy_net::Stack<'static>,
-    payload: &SensorPayload,
-    rng: &mut RoscRng,
-) -> Result<(), &'static str> {
-    // Check network status first
-    if check_network_status(stack) == NetworkStatus::Disconnected {
-        return Err("Network disconnected");
-    }
-
-    let json = payload.to_json();
-    let json_bytes = json.as_bytes();
-
-    defmt::debug!("Submitting to API: {}", json.as_str());
-
-    // Apply timeout to the entire HTTP operation
-    let timeout_duration = Duration::from_secs(HTTP_TIMEOUT_SECS);
-    let result = embassy_time::with_timeout(
-        timeout_duration,
-        do_http_request(stack, json_bytes, rng),
-    )
-    .await;
-
-    match result {
-        Ok(Ok(status)) if status >= 200 && status < 300 => {
-            defmt::info!("API submission successful (status {})", status);
-            log::info!("API submission successful (status {})", status);
-            Ok(())
-        }
-        Ok(Ok(status)) => {
-            defmt::warn!("API submission failed (status {})", status);
-            log::warn!("API submission failed (status {})", status);
-            Err("API returned error status")
-        }
-        Ok(Err(e)) => {
-            defmt::warn!("HTTP request failed: {}", e);
-            log::warn!("HTTP request failed: {}", e);
-            Err(e)
-        }
-        Err(_) => {
-            defmt::warn!("HTTP request timed out after {} seconds", HTTP_TIMEOUT_SECS);
-            log::warn!("HTTP request timed out after {} seconds", HTTP_TIMEOUT_SECS);
-            Err("Request timed out")
-        }
-    }
-}
-
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     // Initialize heap for TLS RSA support (32KB)
@@ -509,11 +166,10 @@ async fn main(spawner: Spawner) {
         Timer::after(Duration::from_millis(100)).await;
     }
 
-    defmt::info!("ENS160 Air Quality Sensor with WiFi starting...");
-    log::info!("ENS160 Air Quality Sensor with WiFi starting...");
+    defmt::info!("SCD40 CO2 Sensor with WiFi starting...");
+    log::info!("SCD40 CO2 Sensor with WiFi starting...");
 
     // Initialize CYW43 (WiFi chip) for onboard LED and networking
-    // Firmware provided by cyw43-firmware crate
     let fw = FIRMWARE;
     let clm = CLM;
 
@@ -587,7 +243,7 @@ async fn main(spawner: Spawner) {
     log::info!("Network ready!");
 
     // Initialize I2C bus for sensors
-    // Using GPIO4 (SDA) and GPIO5 (SCL) - adjust pins as needed for your wiring
+    // Using GPIO4 (SDA) and GPIO5 (SCL)
     let sda = p.PIN_4;
     let scl = p.PIN_5;
     let mut i2c = I2c::new_async(p.I2C0, scl, sda, Irqs, I2cConfig::default());
@@ -604,21 +260,18 @@ async fn main(spawner: Spawner) {
     static I2C_BUS: StaticCell<I2c0Bus> = StaticCell::new();
     let i2c_bus = I2C_BUS.init(Mutex::new(i2c));
 
-    // Create I2C devices for both sensors (shared bus)
-    let ens160_i2c = I2cDevice::new(i2c_bus);
-    let bme280_i2c = I2cDevice::new(i2c_bus);
+    // Create I2C devices for all sensors (shared bus)
+    let scd40_i2c = I2cDevice::new(i2c_bus);
+    let aht20_i2c = I2cDevice::new(i2c_bus);
+    let bmp280_i2c = I2cDevice::new(i2c_bus);
 
-    // ENS160 interrupt pin - adjust as needed for your wiring
-    let mut ens160_int = Input::new(p.PIN_6, Pull::Up);
-
-    // Initialize BME280 first (for environmental compensation)
-    let mut bme280 = match initialize_bme280(bme280_i2c).await {
-        Some(sensor) => sensor,
-        None => {
-            defmt::error!("Failed to initialize BME280 - halting");
-            log::error!("Failed to initialize BME280 - halting");
+    // Initialize SCD40 CO2 sensor (0x62)
+    let mut scd40 = match Scd40Sensor::new(scd40_i2c).await {
+        Ok(sensor) => sensor,
+        Err(e) => {
+            defmt::error!("Failed to initialize SCD40: {} - halting", e);
+            log::error!("Failed to initialize SCD40: {} - halting", e);
             loop {
-                // Blink LED rapidly to indicate error
                 control.gpio_set(0, true).await;
                 Timer::after(Duration::from_millis(100)).await;
                 control.gpio_set(0, false).await;
@@ -627,14 +280,13 @@ async fn main(spawner: Spawner) {
         }
     };
 
-    // Initialize ENS160
-    let mut ens160 = match initialize_ens160(ens160_i2c).await {
-        Some(sensor) => sensor,
-        None => {
-            defmt::error!("Failed to initialize ENS160 - halting");
-            log::error!("Failed to initialize ENS160 - halting");
+    // Initialize AHT20 temperature/humidity sensor (0x38)
+    let mut aht20 = match Aht20Sensor::new(aht20_i2c).await {
+        Ok(sensor) => sensor,
+        Err(e) => {
+            defmt::error!("Failed to initialize AHT20: {} - halting", e);
+            log::error!("Failed to initialize AHT20: {} - halting", e);
             loop {
-                // Blink LED rapidly to indicate error
                 control.gpio_set(0, true).await;
                 Timer::after(Duration::from_millis(100)).await;
                 control.gpio_set(0, false).await;
@@ -643,9 +295,24 @@ async fn main(spawner: Spawner) {
         }
     };
 
-    // Wait for ENS160 warmup period
-    defmt::info!("Waiting for ENS160 warmup period of {} seconds", WARMUP_TIME);
-    log::info!("Waiting for ENS160 warmup period of {} seconds", WARMUP_TIME);
+    // Initialize BMP280 pressure sensor (0x77)
+    let mut bmp280 = match Bmp280Sensor::new(bmp280_i2c).await {
+        Ok(sensor) => sensor,
+        Err(e) => {
+            defmt::error!("Failed to initialize BMP280: {} - halting", e);
+            log::error!("Failed to initialize BMP280: {} - halting", e);
+            loop {
+                control.gpio_set(0, true).await;
+                Timer::after(Duration::from_millis(100)).await;
+                control.gpio_set(0, false).await;
+                Timer::after(Duration::from_millis(100)).await;
+            }
+        }
+    };
+
+    // Wait for SCD40 warmup period
+    defmt::info!("Waiting for SCD40 warmup period of {} seconds", WARMUP_TIME);
+    log::info!("Waiting for SCD40 warmup period of {} seconds", WARMUP_TIME);
     defmt::info!("LED will blink slowly during warmup...");
     log::info!("LED will blink slowly during warmup...");
 
@@ -655,7 +322,7 @@ async fn main(spawner: Spawner) {
         control.gpio_set(0, false).await;
         Timer::after(Duration::from_millis(800)).await;
 
-        if (i + 1) % 30 == 0 {
+        if (i + 1) % 15 == 0 {
             defmt::info!("Warmup: {} / {} seconds", i + 1, WARMUP_TIME);
             log::info!("Warmup: {} / {} seconds", i + 1, WARMUP_TIME);
         }
@@ -673,48 +340,50 @@ async fn main(spawner: Spawner) {
         // Indicate reading with LED
         control.gpio_set(0, true).await;
 
-        // Store readings for API submission
-        let mut env_readings: Option<EnvironmentReadings> = None;
-        let mut aq_readings: Option<Ens160Readings> = None;
+        // Read all sensors
+        let co2_reading = scd40.wait_and_read_co2().await;
+        let temp_humidity_reading = aht20.read().await;
+        let pressure_reading = bmp280.read_pressure().await;
 
-        // Read BME280 for environmental data
-        match read_bme280(&mut bme280).await {
-            Ok(env) => {
+        // Combine readings if all successful
+        let readings = match (co2_reading, temp_humidity_reading, pressure_reading) {
+            (Ok(co2), Ok(th), Ok(pressure_hpa)) => {
+                let temperature_c = th.temperature_c;
+                let temperature_f = (temperature_c * 1.8) + 32.0;
+
                 defmt::info!(
-                    "Environment: {} F, {}% RH, {} hPa",
-                    env.temperature_f, env.humidity_percent, env.pressure_hpa
+                    "CO2: {} ppm, Temp: {} F, Humidity: {}%, Pressure: {} hPa",
+                    co2, temperature_f, th.humidity_percent, pressure_hpa
                 );
                 log::info!(
-                    "Environment: {:.1} F, {:.1}% RH, {:.1} hPa",
-                    env.temperature_f, env.humidity_percent, env.pressure_hpa
+                    "CO2: {} ppm, Temp: {:.1} F, Humidity: {:.1}%, Pressure: {:.1} hPa",
+                    co2, temperature_f, th.humidity_percent, pressure_hpa
                 );
 
-                // Apply temperature and humidity compensation to ENS160
-                let humidity_int = env.humidity_percent as u16;
-                if let Err(e) = ens160.set_temp_rh_comp(env.temperature_c, humidity_int).await {
-                    defmt::warn!("Failed to set ENS160 compensation: {}", Debug2Format(&e));
-                    log::warn!("Failed to set ENS160 compensation: {:?}", e);
-                }
-
-                env_readings = Some(env);
+                Some(SensorReadings {
+                    co2,
+                    temperature_c,
+                    temperature_f,
+                    humidity_percent: th.humidity_percent,
+                    pressure_hpa,
+                })
             }
-            Err(e) => {
-                defmt::warn!("BME280 read failed: {}", e);
-                log::warn!("BME280 read failed: {}", e);
+            (Err(e), _, _) => {
+                defmt::warn!("SCD40 read failed: {}", e);
+                log::warn!("SCD40 read failed: {}", e);
+                None
             }
-        }
-
-        // Read ENS160 air quality data
-        match read_ens160(&mut ens160, &mut ens160_int).await {
-            Ok(readings) => {
-                defmt::debug!("Sensor read successful");
-                aq_readings = Some(readings);
+            (_, Err(e), _) => {
+                defmt::warn!("AHT20 read failed: {}", e);
+                log::warn!("AHT20 read failed: {}", e);
+                None
             }
-            Err(e) => {
-                defmt::error!("ENS160 read failed: {}", e);
-                log::error!("ENS160 read failed: {}", e);
+            (_, _, Err(e)) => {
+                defmt::warn!("BMP280 read failed: {}", e);
+                log::warn!("BMP280 read failed: {}", e);
+                None
             }
-        }
+        };
 
         // Check network status and attempt reconnection if needed
         if check_network_status(stack) == NetworkStatus::Disconnected {
@@ -764,9 +433,9 @@ async fn main(spawner: Spawner) {
             }
         }
 
-        // Submit data to API if both readings are available
-        if let (Some(env), Some(aq)) = (&env_readings, &aq_readings) {
-            let payload = SensorPayload::new(env, aq);
+        // Submit data to API if readings are available
+        if let Some(r) = &readings {
+            let payload = SensorPayload::new(r);
 
             match submit_sensor_data(stack, &payload, &mut rng).await {
                 Ok(()) => {

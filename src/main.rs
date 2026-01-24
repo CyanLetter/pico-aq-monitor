@@ -2,6 +2,7 @@
 //!
 //! Reads CO2 data from an SCD40 sensor, temperature/humidity from AHT20,
 //! and pressure from BMP280. Submits sensor data to a REST API endpoint over WiFi.
+//! WS2812B LED array displays CO2 levels with pulsing animations.
 //! Logs via USB serial (optional) and RTT (for debug probe).
 
 #![no_std]
@@ -9,6 +10,7 @@
 
 extern crate alloc;
 
+mod leds;
 mod network;
 mod sensors;
 mod types;
@@ -29,9 +31,12 @@ use embassy_net::StackResources;
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::i2c::{Async, Config as I2cConfig, I2c, InterruptHandler as I2cInterruptHandler};
-use embassy_rp::peripherals::{DMA_CH0, I2C0, PIO0};
+use embassy_rp::i2c::{Async as I2cAsync, Config as I2cConfig, I2c, InterruptHandler as I2cInterruptHandler};
+use embassy_rp::peripherals::{DMA_CH0, I2C0, PIO0, PIO1};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
+use embassy_rp::pio_programs::ws2812::PioWs2812Program;
+
+use crate::leds::LedController;
 #[cfg(feature = "usb-logging")]
 use embassy_rp::peripherals::USB;
 #[cfg(feature = "usb-logging")]
@@ -55,6 +60,7 @@ use embassy_rp::usb::InterruptHandler as UsbInterruptHandler;
 #[cfg(feature = "usb-logging")]
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
+    PIO1_IRQ_0 => PioInterruptHandler<PIO1>;
     I2C0_IRQ => I2cInterruptHandler<I2C0>;
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
 });
@@ -62,6 +68,7 @@ bind_interrupts!(struct Irqs {
 #[cfg(not(feature = "usb-logging"))]
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
+    PIO1_IRQ_0 => PioInterruptHandler<PIO1>;
     I2C0_IRQ => I2cInterruptHandler<I2C0>;
 });
 
@@ -72,8 +79,14 @@ const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 /// Warmup time for SCD40 sensor in seconds (faster than ENS160's 180s)
 const WARMUP_TIME: u64 = 60;
 
-/// Read interval in seconds
-const READ_INTERVAL: u64 = 120;
+/// LED update interval in milliseconds (for smooth animation)
+const LED_UPDATE_MS: u64 = 50;
+
+/// Sensor read interval in seconds (for LED color updates)
+const SENSOR_READ_SECS: u64 = 5;
+
+/// API submission interval in seconds
+const API_SUBMIT_SECS: u64 = 120;
 
 #[embassy_executor::task]
 async fn cyw43_task(
@@ -109,10 +122,10 @@ async fn logger_task(driver: Driver<'static, USB>) {
 }
 
 /// I2C bus type alias
-type I2c0Bus = Mutex<NoopRawMutex, I2c<'static, I2C0, Async>>;
+type I2c0Bus = Mutex<NoopRawMutex, I2c<'static, I2C0, I2cAsync>>;
 
 /// Scan I2C bus for devices and log results
-async fn scan_i2c_bus(i2c: &mut I2c<'static, I2C0, Async>) {
+async fn scan_i2c_bus(i2c: &mut I2c<'static, I2C0, I2cAsync>) {
     use embedded_hal_async::i2c::I2c as _;
 
     defmt::info!("Scanning I2C bus...");
@@ -242,6 +255,25 @@ async fn main(spawner: Spawner) {
     defmt::info!("Network ready!");
     log::info!("Network ready!");
 
+    // Initialize PIO1 for WS2812B LEDs (PIO0 is used by CYW43 WiFi)
+    // Using GPIO16 for LED data line (single wire)
+    let Pio {
+        common: mut pio1_common,
+        sm0: pio1_sm0,
+        ..
+    } = Pio::new(p.PIO1, Irqs);
+    let ws2812_program = PioWs2812Program::new(&mut pio1_common);
+    let mut led_controller = LedController::new(
+        &mut pio1_common,
+        pio1_sm0,
+        p.DMA_CH1,
+        p.PIN_16,
+        &ws2812_program,
+    );
+
+    defmt::info!("WS2812B LED controller initialized on GPIO16");
+    log::info!("WS2812B LED controller initialized on GPIO16");
+
     // Initialize I2C bus for sensors
     // Using GPIO4 (SDA) and GPIO5 (SCL)
     let sda = p.PIN_4;
@@ -310,21 +342,23 @@ async fn main(spawner: Spawner) {
         }
     };
 
-    // Wait for SCD40 warmup period
+    // Wait for SCD40 warmup period with LED animation
     defmt::info!("Waiting for SCD40 warmup period of {} seconds", WARMUP_TIME);
     log::info!("Waiting for SCD40 warmup period of {} seconds", WARMUP_TIME);
-    defmt::info!("LED will blink slowly during warmup...");
-    log::info!("LED will blink slowly during warmup...");
+    defmt::info!("LEDs will pulse during warmup...");
+    log::info!("LEDs will pulse during warmup...");
 
-    for i in 0..WARMUP_TIME {
-        control.gpio_set(0, true).await;
-        Timer::after(Duration::from_millis(200)).await;
-        control.gpio_set(0, false).await;
-        Timer::after(Duration::from_millis(800)).await;
+    // LED animation during warmup (default CO2 level shows green)
+    let warmup_iterations = (WARMUP_TIME * 1000) / LED_UPDATE_MS;
+    for i in 0..warmup_iterations {
+        let _ = led_controller.update(LED_UPDATE_MS as f32 / 1000.0).await;
+        Timer::after(Duration::from_millis(LED_UPDATE_MS)).await;
 
-        if (i + 1) % 15 == 0 {
-            defmt::info!("Warmup: {} / {} seconds", i + 1, WARMUP_TIME);
-            log::info!("Warmup: {} / {} seconds", i + 1, WARMUP_TIME);
+        // Log progress every 15 seconds
+        let elapsed_secs = (i * LED_UPDATE_MS) / 1000;
+        if elapsed_secs > 0 && elapsed_secs % 15 == 0 && (i * LED_UPDATE_MS) % 1000 == 0 {
+            defmt::info!("Warmup: {} / {} seconds", elapsed_secs, WARMUP_TIME);
+            log::info!("Warmup: {} / {} seconds", elapsed_secs, WARMUP_TIME);
         }
     }
 
@@ -335,136 +369,161 @@ async fn main(spawner: Spawner) {
     let mut consecutive_network_failures: u8 = 0;
     const MAX_FAILURES_BEFORE_RECONNECT: u8 = 3;
 
-    // Main sensor reading loop
+    // Timing counters (in milliseconds)
+    let mut ms_since_sensor_read: u64 = SENSOR_READ_SECS * 1000; // Trigger immediate read
+    let mut ms_since_api_submit: u64 = API_SUBMIT_SECS * 1000; // Trigger immediate submit
+
+    // Latest sensor readings for API submission
+    let mut latest_readings: Option<SensorReadings> = None;
+
+    // Main loop - updates LEDs frequently, reads sensors periodically, submits to API occasionally
     loop {
-        // Indicate reading with LED
-        control.gpio_set(0, true).await;
+        // Update LED animation
+        let _ = led_controller.update(LED_UPDATE_MS as f32 / 1000.0).await;
 
-        // Read all sensors
-        let co2_reading = scd40.wait_and_read_co2().await;
-        let temp_humidity_reading = aht20.read().await;
-        let pressure_reading = bmp280.read_pressure().await;
+        // Check if it's time to read sensors
+        if ms_since_sensor_read >= SENSOR_READ_SECS * 1000 {
+            ms_since_sensor_read = 0;
 
-        // Combine readings if all successful
-        let readings = match (co2_reading, temp_humidity_reading, pressure_reading) {
-            (Ok(co2), Ok(th), Ok(pressure_hpa)) => {
-                let temperature_c = th.temperature_c;
-                let temperature_f = (temperature_c * 1.8) + 32.0;
+            // Indicate reading with onboard LED
+            control.gpio_set(0, true).await;
 
-                defmt::info!(
-                    "CO2: {} ppm, Temp: {} F, Humidity: {}%, Pressure: {} hPa",
-                    co2, temperature_f, th.humidity_percent, pressure_hpa
-                );
-                log::info!(
-                    "CO2: {} ppm, Temp: {:.1} F, Humidity: {:.1}%, Pressure: {:.1} hPa",
-                    co2, temperature_f, th.humidity_percent, pressure_hpa
-                );
+            // Read all sensors
+            let co2_reading = scd40.wait_and_read_co2().await;
+            let temp_humidity_reading = aht20.read().await;
+            let pressure_reading = bmp280.read_pressure().await;
 
-                Some(SensorReadings {
-                    co2,
-                    temperature_c,
-                    temperature_f,
-                    humidity_percent: th.humidity_percent,
-                    pressure_hpa,
-                })
-            }
-            (Err(e), _, _) => {
-                defmt::warn!("SCD40 read failed: {}", e);
-                log::warn!("SCD40 read failed: {}", e);
-                None
-            }
-            (_, Err(e), _) => {
-                defmt::warn!("AHT20 read failed: {}", e);
-                log::warn!("AHT20 read failed: {}", e);
-                None
-            }
-            (_, _, Err(e)) => {
-                defmt::warn!("BMP280 read failed: {}", e);
-                log::warn!("BMP280 read failed: {}", e);
-                None
-            }
-        };
+            // Combine readings if all successful
+            latest_readings = match (co2_reading, temp_humidity_reading, pressure_reading) {
+                (Ok(co2), Ok(th), Ok(pressure_hpa)) => {
+                    let temperature_c = th.temperature_c;
+                    let temperature_f = (temperature_c * 1.8) + 32.0;
 
-        // Check network status and attempt reconnection if needed
-        if check_network_status(stack) == NetworkStatus::Disconnected {
-            defmt::warn!("Network disconnected, attempting to reconnect...");
-            log::warn!("Network disconnected, attempting to reconnect...");
+                    defmt::info!(
+                        "CO2: {} ppm, Temp: {} F, Humidity: {}%, Pressure: {} hPa",
+                        co2, temperature_f, th.humidity_percent, pressure_hpa
+                    );
+                    log::info!(
+                        "CO2: {} ppm, Temp: {:.1} F, Humidity: {:.1}%, Pressure: {:.1} hPa",
+                        co2, temperature_f, th.humidity_percent, pressure_hpa
+                    );
 
-            // Attempt to rejoin WiFi
-            match control.join(WIFI_SSID, JoinOptions::new(WIFI_PASSWORD.as_bytes())).await {
-                Ok(()) => {
-                    defmt::info!("WiFi rejoined, waiting for link...");
-                    log::info!("WiFi rejoined, waiting for link...");
+                    // Update LED color based on CO2 reading
+                    led_controller.set_co2(co2);
 
-                    // Wait for link with timeout
-                    let link_timeout = embassy_time::with_timeout(
-                        Duration::from_secs(10),
-                        stack.wait_link_up(),
-                    )
-                    .await;
+                    Some(SensorReadings {
+                        co2,
+                        temperature_c,
+                        temperature_f,
+                        humidity_percent: th.humidity_percent,
+                        pressure_hpa,
+                    })
+                }
+                (Err(e), _, _) => {
+                    defmt::warn!("SCD40 read failed: {}", e);
+                    log::warn!("SCD40 read failed: {}", e);
+                    latest_readings // Keep previous readings
+                }
+                (_, Err(e), _) => {
+                    defmt::warn!("AHT20 read failed: {}", e);
+                    log::warn!("AHT20 read failed: {}", e);
+                    latest_readings
+                }
+                (_, _, Err(e)) => {
+                    defmt::warn!("BMP280 read failed: {}", e);
+                    log::warn!("BMP280 read failed: {}", e);
+                    latest_readings
+                }
+            };
 
-                    if link_timeout.is_ok() {
-                        // Wait for DHCP with timeout
-                        let dhcp_timeout = embassy_time::with_timeout(
-                            Duration::from_secs(15),
-                            stack.wait_config_up(),
+            control.gpio_set(0, false).await;
+        }
+
+        // Check if it's time to submit to API
+        if ms_since_api_submit >= API_SUBMIT_SECS * 1000 {
+            ms_since_api_submit = 0;
+
+            // Check network status and attempt reconnection if needed
+            if check_network_status(stack) == NetworkStatus::Disconnected {
+                defmt::warn!("Network disconnected, attempting to reconnect...");
+                log::warn!("Network disconnected, attempting to reconnect...");
+
+                // Attempt to rejoin WiFi
+                match control.join(WIFI_SSID, JoinOptions::new(WIFI_PASSWORD.as_bytes())).await {
+                    Ok(()) => {
+                        defmt::info!("WiFi rejoined, waiting for link...");
+                        log::info!("WiFi rejoined, waiting for link...");
+
+                        // Wait for link with timeout
+                        let link_timeout = embassy_time::with_timeout(
+                            Duration::from_secs(10),
+                            stack.wait_link_up(),
                         )
                         .await;
 
-                        if dhcp_timeout.is_ok() {
-                            if let Some(config) = stack.config_v4() {
-                                defmt::info!("Reconnected with IP: {}", Debug2Format(&config.address));
-                                log::info!("Reconnected with IP: {:?}", config.address);
+                        if link_timeout.is_ok() {
+                            // Wait for DHCP with timeout
+                            let dhcp_timeout = embassy_time::with_timeout(
+                                Duration::from_secs(15),
+                                stack.wait_config_up(),
+                            )
+                            .await;
+
+                            if dhcp_timeout.is_ok() {
+                                if let Some(config) = stack.config_v4() {
+                                    defmt::info!("Reconnected with IP: {}", Debug2Format(&config.address));
+                                    log::info!("Reconnected with IP: {:?}", config.address);
+                                }
+                                consecutive_network_failures = 0;
+                            } else {
+                                defmt::warn!("DHCP timeout during reconnection");
+                                log::warn!("DHCP timeout during reconnection");
                             }
-                            consecutive_network_failures = 0;
                         } else {
-                            defmt::warn!("DHCP timeout during reconnection");
-                            log::warn!("DHCP timeout during reconnection");
+                            defmt::warn!("Link timeout during reconnection");
+                            log::warn!("Link timeout during reconnection");
                         }
-                    } else {
-                        defmt::warn!("Link timeout during reconnection");
-                        log::warn!("Link timeout during reconnection");
+                    }
+                    Err(e) => {
+                        defmt::warn!("WiFi rejoin failed: {}", Debug2Format(&e));
+                        log::warn!("WiFi rejoin failed, will retry next cycle");
                     }
                 }
-                Err(e) => {
-                    defmt::warn!("WiFi rejoin failed: {}", Debug2Format(&e));
-                    log::warn!("WiFi rejoin failed, will retry next cycle");
-                }
             }
-        }
 
-        // Submit data to API if readings are available
-        if let Some(r) = &readings {
-            let payload = SensorPayload::new(r);
+            // Submit data to API if readings are available
+            if let Some(r) = &latest_readings {
+                let payload = SensorPayload::new(r);
 
-            match submit_sensor_data(stack, &payload, &mut rng).await {
-                Ok(()) => {
-                    defmt::debug!("Data submitted to API");
-                    consecutive_network_failures = 0;
-                }
-                Err(e) => {
-                    defmt::warn!("API submission failed: {}", e);
-                    log::warn!("API submission failed: {}", e);
+                match submit_sensor_data(stack, &payload, &mut rng).await {
+                    Ok(()) => {
+                        defmt::debug!("Data submitted to API");
+                        consecutive_network_failures = 0;
+                    }
+                    Err(e) => {
+                        defmt::warn!("API submission failed: {}", e);
+                        log::warn!("API submission failed: {}", e);
 
-                    consecutive_network_failures = consecutive_network_failures.saturating_add(1);
+                        consecutive_network_failures = consecutive_network_failures.saturating_add(1);
 
-                    if consecutive_network_failures >= MAX_FAILURES_BEFORE_RECONNECT {
-                        defmt::warn!(
-                            "Multiple consecutive failures ({}), will check network next cycle",
-                            consecutive_network_failures
-                        );
-                        log::warn!(
-                            "Multiple consecutive failures ({}), will check network next cycle",
-                            consecutive_network_failures
-                        );
+                        if consecutive_network_failures >= MAX_FAILURES_BEFORE_RECONNECT {
+                            defmt::warn!(
+                                "Multiple consecutive failures ({}), will check network next cycle",
+                                consecutive_network_failures
+                            );
+                            log::warn!(
+                                "Multiple consecutive failures ({}), will check network next cycle",
+                                consecutive_network_failures
+                            );
+                        }
                     }
                 }
             }
         }
 
-        control.gpio_set(0, false).await;
-
-        // Wait before next reading
-        Timer::after(Duration::from_secs(READ_INTERVAL)).await;
+        // Wait for next LED update cycle
+        Timer::after(Duration::from_millis(LED_UPDATE_MS)).await;
+        ms_since_sensor_read += LED_UPDATE_MS;
+        ms_since_api_submit += LED_UPDATE_MS;
     }
 }

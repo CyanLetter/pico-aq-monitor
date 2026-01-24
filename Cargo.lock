@@ -1435,6 +1435,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
 
 [[package]]
+name = "libm"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9fbbcab51052fe104eb5e5d351cf728d30a5be1fe14d9be8a3b097481fb97de"
+
+[[package]]
 name = "linked_list_allocator"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2018,6 +2024,7 @@ dependencies = [
  "embedded-io-async 0.7.0",
  "embedded-tls",
  "heapless 0.8.0",
+ "libm",
  "log",
  "panic-probe",
  "portable-atomic",
@@ -2025,6 +2032,7 @@ dependencies = [
  "scd4x",
  "serde",
  "serde-json-core",
+ "smart-leds",
  "static_cell",
 ]
 

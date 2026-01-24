@@ -41,6 +41,10 @@ scd4x = { version = "0.4.1", features = ["embedded-hal-async"] }  # CO2 sensor
 aht20-async = "1.0"  # Temperature/humidity
 bme280-rs = "0.3"  # Reuse for BMP280 pressure readings
 
+# LED support
+smart-leds = "0.4"  # RGB color types (used by embassy-rp PIO WS2812)
+libm = "0.2"  # Math functions for no_std (sin for animations)
+
 # Logging
 defmt = "1.0.1"
 defmt-rtt = "1.0.0"

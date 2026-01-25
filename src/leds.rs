@@ -9,11 +9,18 @@ use embassy_rp::Peri;
 use embassy_rp::peripherals::{DMA_CH1, PIN_16, PIO1};
 use embassy_rp::pio::{Common, StateMachine};
 use embassy_rp::pio_programs::ws2812::{Grb, PioWs2812, PioWs2812Program};
-use libm::sinf;
+use libm::{powf, sinf};
 use smart_leds::RGB8;
 
 /// Number of LEDs in the array
 pub const NUM_LEDS: usize = 8;
+
+/// Gamma correction value for WS2812B LEDs
+///
+/// LEDs have a non-linear brightness response. Gamma correction compensates
+/// for this, making perceived brightness changes more uniform across the range.
+/// A value of 2.0 is typical for WS2812B LEDs.
+const GAMMA: f32 = 2.0;
 
 /// CO2 thresholds for color changes (in ppm)
 mod thresholds {
@@ -52,17 +59,37 @@ fn co2_to_color(co2_ppm: u16) -> RGB8 {
     }
 }
 
-/// Scale a color by a brightness factor (0.0 to 1.0)
+/// Apply gamma correction to a single channel value
+///
+/// Takes a linear value (0-255) and returns a gamma-corrected value.
+/// This compensates for the non-linear brightness response of LEDs,
+/// making perceived brightness changes more uniform.
+#[inline]
+fn gamma_correct_channel(value: u8) -> u8 {
+    // Normalize to 0.0-1.0, apply gamma, scale back to 0-255
+    let normalized = value as f32 / 255.0;
+    let corrected = powf(normalized, GAMMA);
+    (corrected * 255.0) as u8
+}
+
+/// Scale a color by a brightness factor (0.0 to 1.0) with gamma correction
+///
+/// Applies brightness scaling first, then gamma correction to each channel.
+/// This produces perceptually uniform brightness transitions.
 fn scale_color(color: RGB8, brightness: f32) -> RGB8 {
     let brightness = brightness.clamp(0.0, 1.0);
-    // defmt::info!("Brightness is {}", brightness);
-    let scaled = RGB8::new(
-        (color.r as f32 * brightness) as u8,
-        (color.g as f32 * brightness) as u8,
-        (color.b as f32 * brightness) as u8,
-    );
-    // defmt::info!("R: {} G: {} B: {}", scaled.r, scaled.g, scaled.b);
-    scaled
+
+    // Scale by brightness first (linear)
+    let r_linear = (color.r as f32 * brightness) as u8;
+    let g_linear = (color.g as f32 * brightness) as u8;
+    let b_linear = (color.b as f32 * brightness) as u8;
+
+    // Apply gamma correction to each channel
+    RGB8::new(
+        gamma_correct_channel(r_linear),
+        gamma_correct_channel(g_linear),
+        gamma_correct_channel(b_linear),
+    )
 }
 
 /// Calculate pulsing brightness for a single LED in the sequence.
@@ -132,9 +159,11 @@ impl<'d> LedController<'d> {
         let mut led_colors = [RGB8::default(); NUM_LEDS];
 
         // Animation parameters
+        // With gamma correction (γ=2.0), brightness is perceptually linear
+        // so we can use a wider range for more visible animation
         const WAVE_SPEED: f32 = 8.0; // Slow, gentle pulse
-        const MIN_BRIGHTNESS: f32 = 0.01;
-        const MAX_BRIGHTNESS: f32 = 0.2;
+        const MIN_BRIGHTNESS: f32 = 0.05; // More visible minimum with gamma
+        const MAX_BRIGHTNESS: f32 = 0.3; // Brighter max now that low end is usable
 
         for i in 0..NUM_LEDS {
             let brightness = pulse_brightness(

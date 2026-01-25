@@ -51,19 +51,16 @@ async fn do_http_request(
     let mut http_client = HttpClient::new_with_tls(&tcp_client, &dns_client, tls_config);
 
     defmt::info!("Creating request for endpoint: {}", API_ENDPOINT);
-    log::info!("Creating request for endpoint: {}", API_ENDPOINT);
 
     let request = match http_client.request(Method::POST, API_ENDPOINT).await {
         Ok(req) => req,
         Err(e) => {
             defmt::error!("Failed to create HTTP request: {}", Debug2Format(&e));
-            log::error!("Failed to create HTTP request: {:?}", e);
             return Err("Failed to create HTTP request");
         }
     };
 
     defmt::info!("Request created, sending...");
-    log::info!("Request created, sending...");
 
     let headers = [("Content-Type", "application/json"), ("X-API-Key", API_KEY)];
     let mut request = request.headers(&headers).body(json_bytes);
@@ -72,7 +69,6 @@ async fn do_http_request(
         Ok(resp) => resp,
         Err(e) => {
             defmt::error!("Failed to send HTTP request: {}", Debug2Format(&e));
-            log::error!("Failed to send HTTP request: {:?}", e);
             return Err("Failed to send HTTP request");
         }
     };
@@ -107,22 +103,18 @@ pub async fn submit_sensor_data(
     match result {
         Ok(Ok(status)) if status >= 200 && status < 300 => {
             defmt::info!("API submission successful (status {})", status);
-            log::info!("API submission successful (status {})", status);
             Ok(())
         }
         Ok(Ok(status)) => {
             defmt::warn!("API submission failed (status {})", status);
-            log::warn!("API submission failed (status {})", status);
             Err("API returned error status")
         }
         Ok(Err(e)) => {
             defmt::warn!("HTTP request failed: {}", e);
-            log::warn!("HTTP request failed: {}", e);
             Err(e)
         }
         Err(_) => {
             defmt::warn!("HTTP request timed out after {} seconds", HTTP_TIMEOUT_SECS);
-            log::warn!("HTTP request timed out after {} seconds", HTTP_TIMEOUT_SECS);
             Err("Request timed out")
         }
     }

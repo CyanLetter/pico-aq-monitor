@@ -3,7 +3,7 @@
 //! Reads CO2 data from an SCD40 sensor, temperature/humidity from AHT20,
 //! and pressure from BMP280. Submits sensor data to a REST API endpoint over WiFi.
 //! WS2812B LED array displays CO2 levels with pulsing animations.
-//! Logs via USB serial (optional) and RTT (for debug probe).
+//! Logs via RTT (requires debug probe).
 
 #![no_std]
 #![no_main]
@@ -37,15 +37,9 @@ use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::pio_programs::ws2812::PioWs2812Program;
 
 use crate::leds::LedController;
-#[cfg(feature = "usb-logging")]
-use embassy_rp::peripherals::USB;
-#[cfg(feature = "usb-logging")]
-use embassy_rp::usb::Driver;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
-#[cfg(feature = "usb-logging")]
-use embassy_usb_logger::ReceiverHandler;
 use static_cell::StaticCell;
 
 use crate::network::{check_network_status, submit_sensor_data};
@@ -54,18 +48,6 @@ use crate::types::{NetworkStatus, SensorPayload, SensorReadings};
 
 use {defmt_rtt as _, panic_probe as _};
 
-#[cfg(feature = "usb-logging")]
-use embassy_rp::usb::InterruptHandler as UsbInterruptHandler;
-
-#[cfg(feature = "usb-logging")]
-bind_interrupts!(struct Irqs {
-    PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
-    PIO1_IRQ_0 => PioInterruptHandler<PIO1>;
-    I2C0_IRQ => I2cInterruptHandler<I2C0>;
-    USBCTRL_IRQ => UsbInterruptHandler<USB>;
-});
-
-#[cfg(not(feature = "usb-logging"))]
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
     PIO1_IRQ_0 => PioInterruptHandler<PIO1>;
@@ -100,27 +82,6 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
     runner.run().await
 }
 
-/// USB serial logger task (only compiled when usb-logging feature is enabled)
-#[cfg(feature = "usb-logging")]
-struct Handler;
-
-#[cfg(feature = "usb-logging")]
-impl ReceiverHandler for Handler {
-    fn new() -> Self {
-        Handler
-    }
-
-    async fn handle_data(&self, _data: &[u8]) {
-        // Ignore incoming data from USB serial
-    }
-}
-
-#[cfg(feature = "usb-logging")]
-#[embassy_executor::task]
-async fn logger_task(driver: Driver<'static, USB>) {
-    embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver, Handler);
-}
-
 /// I2C bus type alias
 type I2c0Bus = Mutex<NoopRawMutex, I2c<'static, I2C0, I2cAsync>>;
 
@@ -129,7 +90,6 @@ async fn scan_i2c_bus(i2c: &mut I2c<'static, I2C0, I2cAsync>) {
     use embedded_hal_async::i2c::I2c as _;
 
     defmt::info!("Scanning I2C bus...");
-    log::info!("Scanning I2C bus...");
 
     let mut found_count = 0;
 
@@ -139,17 +99,14 @@ async fn scan_i2c_bus(i2c: &mut I2c<'static, I2C0, I2cAsync>) {
         let mut buf = [0u8; 1];
         if i2c.read(addr, &mut buf).await.is_ok() {
             defmt::info!("  Found device at address 0x{:02X}", addr);
-            log::info!("  Found device at address 0x{:02X}", addr);
             found_count += 1;
         }
     }
 
     if found_count == 0 {
         defmt::warn!("No I2C devices found!");
-        log::warn!("No I2C devices found!");
     } else {
         defmt::info!("Found {} device(s)", found_count);
-        log::info!("Found {} device(s)", found_count);
     }
 }
 
@@ -170,17 +127,7 @@ async fn main(spawner: Spawner) {
     // Initialize random number generator for network stack
     let mut rng = RoscRng;
 
-    // Initialize USB serial logger (only when usb-logging feature is enabled)
-    #[cfg(feature = "usb-logging")]
-    {
-        let usb_driver = Driver::new(p.USB, Irqs);
-        spawner.spawn(logger_task(usb_driver)).unwrap();
-        // Give USB time to enumerate before logging
-        Timer::after(Duration::from_millis(100)).await;
-    }
-
     defmt::info!("SCD40 CO2 Sensor with WiFi starting...");
-    log::info!("SCD40 CO2 Sensor with WiFi starting...");
 
     // Initialize CYW43 (WiFi chip) for onboard LED and networking
     let fw = FIRMWARE;
@@ -226,34 +173,28 @@ async fn main(spawner: Spawner) {
 
     // Connect to WiFi
     defmt::info!("Connecting to WiFi network: {}", WIFI_SSID);
-    log::info!("Connecting to WiFi network: {}", WIFI_SSID);
 
     loop {
         match control.join(WIFI_SSID, JoinOptions::new(WIFI_PASSWORD.as_bytes())).await {
             Ok(()) => break,
             Err(e) => {
                 defmt::warn!("WiFi join failed: {}", Debug2Format(&e));
-                log::warn!("WiFi join failed, retrying...");
                 Timer::after(Duration::from_secs(1)).await;
             }
         }
     }
 
     defmt::info!("WiFi connected, waiting for link...");
-    log::info!("WiFi connected, waiting for link...");
     stack.wait_link_up().await;
 
     defmt::info!("Link up, waiting for DHCP...");
-    log::info!("Link up, waiting for DHCP...");
     stack.wait_config_up().await;
 
     if let Some(config) = stack.config_v4() {
         defmt::info!("Got IP address: {}", Debug2Format(&config.address));
-        log::info!("Got IP address: {:?}", config.address);
     }
 
     defmt::info!("Network ready!");
-    log::info!("Network ready!");
 
     // Initialize PIO1 for WS2812B LEDs (PIO0 is used by CYW43 WiFi)
     // Using GPIO16 for LED data line (single wire)
@@ -272,7 +213,6 @@ async fn main(spawner: Spawner) {
     );
 
     defmt::info!("WS2812B LED controller initialized on GPIO16");
-    log::info!("WS2812B LED controller initialized on GPIO16");
 
     // Initialize I2C bus for sensors
     // Using GPIO4 (SDA) and GPIO5 (SCL)
@@ -282,7 +222,6 @@ async fn main(spawner: Spawner) {
 
     // Wait for sensors to power up before scanning
     defmt::info!("Waiting for I2C devices to power up...");
-    log::info!("Waiting for I2C devices to power up...");
     Timer::after(Duration::from_millis(2000)).await;
 
     // Scan I2C bus to find devices
@@ -302,7 +241,6 @@ async fn main(spawner: Spawner) {
         Ok(sensor) => sensor,
         Err(e) => {
             defmt::error!("Failed to initialize SCD40: {} - halting", e);
-            log::error!("Failed to initialize SCD40: {} - halting", e);
             loop {
                 control.gpio_set(0, true).await;
                 Timer::after(Duration::from_millis(100)).await;
@@ -317,7 +255,6 @@ async fn main(spawner: Spawner) {
         Ok(sensor) => sensor,
         Err(e) => {
             defmt::error!("Failed to initialize AHT20: {} - halting", e);
-            log::error!("Failed to initialize AHT20: {} - halting", e);
             loop {
                 control.gpio_set(0, true).await;
                 Timer::after(Duration::from_millis(100)).await;
@@ -332,7 +269,6 @@ async fn main(spawner: Spawner) {
         Ok(sensor) => sensor,
         Err(e) => {
             defmt::error!("Failed to initialize BMP280: {} - halting", e);
-            log::error!("Failed to initialize BMP280: {} - halting", e);
             loop {
                 control.gpio_set(0, true).await;
                 Timer::after(Duration::from_millis(100)).await;
@@ -344,9 +280,7 @@ async fn main(spawner: Spawner) {
 
     // Wait for SCD40 warmup period with LED animation
     defmt::info!("Waiting for SCD40 warmup period of {} seconds", WARMUP_TIME);
-    log::info!("Waiting for SCD40 warmup period of {} seconds", WARMUP_TIME);
     defmt::info!("LEDs will pulse during warmup...");
-    log::info!("LEDs will pulse during warmup...");
 
     // LED animation during warmup (default CO2 level shows green)
     let warmup_iterations = (WARMUP_TIME * 1000) / LED_UPDATE_MS;
@@ -358,12 +292,10 @@ async fn main(spawner: Spawner) {
         let elapsed_secs = (i * LED_UPDATE_MS) / 1000;
         if elapsed_secs > 0 && elapsed_secs % 15 == 0 && (i * LED_UPDATE_MS) % 1000 == 0 {
             defmt::info!("Warmup: {} / {} seconds", elapsed_secs, WARMUP_TIME);
-            log::info!("Warmup: {} / {} seconds", elapsed_secs, WARMUP_TIME);
         }
     }
 
     defmt::info!("Warmup complete - starting continuous readings");
-    log::info!("Warmup complete - starting continuous readings");
 
     // Track network status for reconnection
     let mut consecutive_network_failures: u8 = 0;
@@ -403,10 +335,6 @@ async fn main(spawner: Spawner) {
                         "CO2: {} ppm, Temp: {} F, Humidity: {}%, Pressure: {} hPa",
                         co2, temperature_f, th.humidity_percent, pressure_hpa
                     );
-                    log::info!(
-                        "CO2: {} ppm, Temp: {:.1} F, Humidity: {:.1}%, Pressure: {:.1} hPa",
-                        co2, temperature_f, th.humidity_percent, pressure_hpa
-                    );
 
                     // Update LED color based on CO2 reading
                     led_controller.set_co2(co2);
@@ -421,17 +349,14 @@ async fn main(spawner: Spawner) {
                 }
                 (Err(e), _, _) => {
                     defmt::warn!("SCD40 read failed: {}", e);
-                    log::warn!("SCD40 read failed: {}", e);
                     latest_readings // Keep previous readings
                 }
                 (_, Err(e), _) => {
                     defmt::warn!("AHT20 read failed: {}", e);
-                    log::warn!("AHT20 read failed: {}", e);
                     latest_readings
                 }
                 (_, _, Err(e)) => {
                     defmt::warn!("BMP280 read failed: {}", e);
-                    log::warn!("BMP280 read failed: {}", e);
                     latest_readings
                 }
             };
@@ -446,13 +371,11 @@ async fn main(spawner: Spawner) {
             // Check network status and attempt reconnection if needed
             if check_network_status(stack) == NetworkStatus::Disconnected {
                 defmt::warn!("Network disconnected, attempting to reconnect...");
-                log::warn!("Network disconnected, attempting to reconnect...");
 
                 // Attempt to rejoin WiFi
                 match control.join(WIFI_SSID, JoinOptions::new(WIFI_PASSWORD.as_bytes())).await {
                     Ok(()) => {
                         defmt::info!("WiFi rejoined, waiting for link...");
-                        log::info!("WiFi rejoined, waiting for link...");
 
                         // Wait for link with timeout
                         let link_timeout = embassy_time::with_timeout(
@@ -472,21 +395,17 @@ async fn main(spawner: Spawner) {
                             if dhcp_timeout.is_ok() {
                                 if let Some(config) = stack.config_v4() {
                                     defmt::info!("Reconnected with IP: {}", Debug2Format(&config.address));
-                                    log::info!("Reconnected with IP: {:?}", config.address);
                                 }
                                 consecutive_network_failures = 0;
                             } else {
                                 defmt::warn!("DHCP timeout during reconnection");
-                                log::warn!("DHCP timeout during reconnection");
                             }
                         } else {
                             defmt::warn!("Link timeout during reconnection");
-                            log::warn!("Link timeout during reconnection");
                         }
                     }
                     Err(e) => {
                         defmt::warn!("WiFi rejoin failed: {}", Debug2Format(&e));
-                        log::warn!("WiFi rejoin failed, will retry next cycle");
                     }
                 }
             }
@@ -502,16 +421,11 @@ async fn main(spawner: Spawner) {
                     }
                     Err(e) => {
                         defmt::warn!("API submission failed: {}", e);
-                        log::warn!("API submission failed: {}", e);
 
                         consecutive_network_failures = consecutive_network_failures.saturating_add(1);
 
                         if consecutive_network_failures >= MAX_FAILURES_BEFORE_RECONNECT {
                             defmt::warn!(
-                                "Multiple consecutive failures ({}), will check network next cycle",
-                                consecutive_network_failures
-                            );
-                            log::warn!(
                                 "Multiple consecutive failures ({}), will check network next cycle",
                                 consecutive_network_failures
                             );

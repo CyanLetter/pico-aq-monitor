@@ -43,7 +43,6 @@ where
         }
 
         defmt::info!("BMP280 initialized successfully");
-        log::info!("BMP280 initialized successfully");
 
         Ok(Self { sensor })
     }

@@ -73,8 +73,6 @@ where
 
         defmt::info!("=== SCD40 FORCED RECALIBRATION MODE ===");
         defmt::info!("Ensure sensor is exposed to fresh outdoor air (~428 ppm CO2)");
-        log::info!("=== SCD40 FORCED RECALIBRATION MODE ===");
-        log::info!("Ensure sensor is exposed to fresh outdoor air (~428 ppm CO2)");
 
         // Step 1: Stop any ongoing measurement
         defmt::info!("Stopping any ongoing measurements...");
@@ -88,7 +86,6 @@ where
 
         // Step 3: Start periodic measurement for warmup
         defmt::info!("Starting periodic measurement for {} second warmup...", FRC_WARMUP_SECS);
-        log::info!("Starting periodic measurement for {} second warmup...", FRC_WARMUP_SECS);
         scd40_send_cmd(&mut i2c, 0x21B1).await?; // start_periodic_measurement
 
         // Step 4: Wait 3 minutes for warmup
@@ -96,13 +93,11 @@ where
             Timer::after(Duration::from_secs(1)).await;
             if (i + 1) % 30 == 0 {
                 defmt::info!("FRC warmup: {} / {} seconds", i + 1, FRC_WARMUP_SECS);
-                log::info!("FRC warmup: {} / {} seconds", i + 1, FRC_WARMUP_SECS);
             }
         }
 
         // Step 5: Stop periodic measurement
         defmt::info!("Stopping periodic measurement for FRC...");
-        log::info!("Stopping periodic measurement for FRC...");
         scd40_send_cmd(&mut i2c, 0x3F86).await?; // stop_periodic_measurement
 
         // Step 6: Wait at least 500ms (using 1s for safety)
@@ -110,7 +105,6 @@ where
 
         // Step 7: Perform forced recalibration
         defmt::info!("Performing forced recalibration with target {} ppm...", FRC_TARGET_CO2_PPM);
-        log::info!("Performing forced recalibration with target {} ppm...", FRC_TARGET_CO2_PPM);
 
         // Command 0x362F: perform_forced_recalibration
         // Format: [cmd_hi, cmd_lo, data_hi, data_lo, crc]
@@ -155,7 +149,6 @@ where
         // Check if FRC failed (0xFFFF indicates failure)
         if frc_correction == 0xFFFF {
             defmt::error!("SCD40 forced recalibration FAILED (returned 0xFFFF)");
-            log::error!("SCD40 forced recalibration FAILED (returned 0xFFFF)");
             return Err("Forced recalibration failed - sensor returned 0xFFFF");
         }
 
@@ -164,11 +157,8 @@ where
         let correction_ppm = frc_correction as i32 - 0x8000;
         defmt::info!("SCD40 forced recalibration SUCCESS!");
         defmt::info!("FRC correction value: {} ppm (raw: 0x{:04X})", correction_ppm, frc_correction);
-        log::info!("SCD40 forced recalibration SUCCESS!");
-        log::info!("FRC correction value: {} ppm (raw: 0x{:04X})", correction_ppm, frc_correction);
 
         defmt::info!("=== FRC COMPLETE - Sensor calibrated ===");
-        log::info!("=== FRC COMPLETE - Sensor calibrated ===");
 
         // Now initialize the sensor normally
         Self::init_sensor(i2c).await
@@ -202,7 +192,6 @@ where
         }
 
         defmt::info!("SCD40 initialized successfully");
-        log::info!("SCD40 initialized successfully");
 
         Ok(Self { sensor })
     }
@@ -219,8 +208,7 @@ where
                     // Data is ready, read the measurement
                     match self.sensor.measurement().await {
                         Ok(measurement) => {
-                            defmt::info!("CO2: {} ppm", measurement.co2);
-                            log::info!("CO2: {} ppm", measurement.co2);
+                            defmt::debug!("CO2: {} ppm", measurement.co2);
                             return Ok(measurement.co2);
                         }
                         Err(e) => {

@@ -7,8 +7,6 @@ description = "SCD40 CO2 sensor with AHT20/BMP280 on Raspberry Pi Pico W"
 
 [features]
 default = []
-# Enable USB serial logging (requires USB host connection - will hang on power-only USB)
-usb-logging = ["dep:embassy-usb", "dep:embassy-usb-logger"]
 # Perform forced recalibration of SCD40 on startup (expose sensor to fresh air ~428ppm)
 scd40-frc = []
 
@@ -19,8 +17,6 @@ embassy-sync = { version = "0.7.2", features = ["defmt"] }
 embassy-executor = { version = "0.9.0", features = ["arch-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
 embassy-time = { version = "0.5.0", features = ["defmt", "defmt-timestamp-uptime"] }
 embassy-rp = { version = "0.9.0", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp2040"] }
-embassy-usb = { version = "0.5.1", features = ["defmt"], optional = true }
-embassy-usb-logger = { version = "0.5.1", optional = true }
 
 # CYW43 WiFi chip (for Pico W LED and networking)
 cyw43 = { version = "0.6.0", features = ["defmt", "firmware-logs"] }
@@ -50,7 +46,6 @@ libm = "0.2"  # Math functions for no_std (sin for animations)
 # Logging
 defmt = "1.0.1"
 defmt-rtt = "1.0.0"
-log = "0.4"
 
 # Embedded essentials
 cortex-m = { version = "0.7.6", features = ["inline-asm"] }

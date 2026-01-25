@@ -28,7 +28,6 @@ where
         };
 
         defmt::info!("AHT20 initialized successfully");
-        log::info!("AHT20 initialized successfully");
 
         Ok(Self { sensor })
     }

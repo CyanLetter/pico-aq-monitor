@@ -9,6 +9,8 @@ description = "SCD40 CO2 sensor with AHT20/BMP280 on Raspberry Pi Pico W"
 default = []
 # Enable USB serial logging (requires USB host connection - will hang on power-only USB)
 usb-logging = ["dep:embassy-usb", "dep:embassy-usb-logger"]
+# Perform forced recalibration of SCD40 on startup (expose sensor to fresh air ~428ppm)
+scd40-frc = []
 
 [dependencies]
 # Embassy framework (crates.io)

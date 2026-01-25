@@ -56,13 +56,13 @@ fn co2_to_color(co2_ppm: u16) -> RGB8 {
 fn scale_color(color: RGB8, brightness: f32) -> RGB8 {
     let brightness = brightness.clamp(0.0, 1.0);
     // defmt::info!("Brightness is {}", brightness);
-    let newColor = RGB8::new(
+    let scaled = RGB8::new(
         (color.r as f32 * brightness) as u8,
         (color.g as f32 * brightness) as u8,
         (color.b as f32 * brightness) as u8,
     );
-    // defmt::info!("R: {} G: {} B: {}", newColor.r, newColor.g, newColor.b);
-    return newColor;
+    // defmt::info!("R: {} G: {} B: {}", scaled.r, scaled.g, scaled.b);
+    scaled
 }
 
 /// Calculate pulsing brightness for a single LED in the sequence.

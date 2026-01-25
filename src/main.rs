@@ -4,6 +4,11 @@
 //! and pressure from BMP280. Submits sensor data to a REST API endpoint over WiFi.
 //! WS2812B LED array displays CO2 levels with pulsing animations.
 //! Logs via RTT (requires debug probe).
+//!
+//! Architecture:
+//! - Main task: LED animation + sensor reading (never blocks on network)
+//! - Network task: Handles API submissions independently
+//! - Watchdog: Resets device if main loop hangs
 
 #![no_std]
 #![no_main]
@@ -16,6 +21,7 @@ mod sensors;
 mod types;
 
 use embedded_alloc::LlffHeap as Heap;
+use portable_atomic::{AtomicU32, Ordering};
 
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
@@ -35,13 +41,14 @@ use embassy_rp::i2c::{Async as I2cAsync, Config as I2cConfig, I2c, InterruptHand
 use embassy_rp::peripherals::{DMA_CH0, I2C0, PIO0, PIO1};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::pio_programs::ws2812::PioWs2812Program;
-
-use crate::leds::LedController;
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_rp::watchdog::Watchdog;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use static_cell::StaticCell;
 
+use crate::leds::LedController;
 use crate::network::{check_network_status, submit_sensor_data};
 use crate::sensors::{Aht20Sensor, Bmp280Sensor, Scd40Sensor};
 use crate::types::{NetworkStatus, SensorPayload, SensorReadings};
@@ -70,6 +77,49 @@ const SENSOR_READ_SECS: u64 = 5;
 /// API submission interval in seconds
 const API_SUBMIT_SECS: u64 = 120;
 
+/// Health logging interval in seconds
+const HEALTH_LOG_SECS: u64 = 300; // Every 5 minutes
+
+/// Watchdog timeout in milliseconds (must feed within this time)
+const WATCHDOG_TIMEOUT_MS: u64 = 8000;
+
+/// Channel for sending sensor readings to network task
+static SENSOR_CHANNEL: Channel<CriticalSectionRawMutex, SensorReadings, 2> = Channel::new();
+
+/// Uptime counter in seconds (atomic for cross-task access)
+static UPTIME_SECS: AtomicU32 = AtomicU32::new(0);
+
+/// I2C bus type alias
+type I2c0Bus = Mutex<CriticalSectionRawMutex, I2c<'static, I2C0, I2cAsync>>;
+
+/// Attempt to recover a stuck I2C bus by toggling SCL
+///
+/// I2C slaves can get stuck holding SDA low if a transaction is interrupted.
+/// Toggling SCL up to 9 times allows the slave to complete its byte and release SDA.
+fn recover_i2c_bus(scl_pin: &mut Output<'_>, _sda_pin: &Output<'_>) {
+    // Check if SDA is stuck low
+    // Note: We can't easily read SDA state here, so we just do the recovery sequence
+    defmt::info!("Attempting I2C bus recovery...");
+
+    // Temporarily use SCL as output to send clock pulses
+    // Toggle SCL up to 9 times (one byte + ACK)
+    for i in 0..9 {
+        // SCL low
+        scl_pin.set_low();
+        cortex_m::asm::delay(1000); // ~10us at 125MHz
+
+        // SCL high
+        scl_pin.set_high();
+        cortex_m::asm::delay(1000);
+
+        defmt::trace!("I2C recovery pulse {}", i + 1);
+    }
+
+    // Generate STOP condition: SDA low, then SCL high, then SDA high
+    // This is approximate since we don't control SDA here
+    defmt::info!("I2C bus recovery complete");
+}
+
 #[embassy_executor::task]
 async fn cyw43_task(
     runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>,
@@ -82,8 +132,77 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
     runner.run().await
 }
 
-/// I2C bus type alias
-type I2c0Bus = Mutex<NoopRawMutex, I2c<'static, I2C0, I2cAsync>>;
+/// Network submission task - runs independently of main loop
+///
+/// Receives sensor readings via channel and submits to API.
+/// This allows LED animations to continue during network operations.
+#[embassy_executor::task]
+async fn api_submit_task(stack: embassy_net::Stack<'static>) {
+    defmt::info!("API submission task started");
+
+    let mut rng = RoscRng;
+    let mut consecutive_failures: u8 = 0;
+
+    loop {
+        // Wait for sensor readings from the channel
+        let readings = SENSOR_CHANNEL.receive().await;
+
+        defmt::debug!("Network task received readings: CO2={} ppm", readings.co2);
+
+        // Check network status
+        if check_network_status(stack) == NetworkStatus::Disconnected {
+            defmt::warn!("Network disconnected, skipping API submission");
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            continue;
+        }
+
+        // Submit to API
+        let payload = SensorPayload::new(&readings);
+        match submit_sensor_data(stack, &payload, &mut rng).await {
+            Ok(()) => {
+                defmt::debug!("API submission successful");
+                consecutive_failures = 0;
+            }
+            Err(e) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                defmt::warn!(
+                    "API submission failed (attempt {}): {}",
+                    consecutive_failures,
+                    e
+                );
+            }
+        }
+    }
+}
+
+/// Uptime tracking task - increments uptime counter every second
+#[embassy_executor::task]
+async fn uptime_task() {
+    loop {
+        Timer::after(Duration::from_secs(1)).await;
+        UPTIME_SECS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Log system health information
+fn log_health() {
+    let uptime = UPTIME_SECS.load(Ordering::Relaxed);
+    let hours = uptime / 3600;
+    let minutes = (uptime % 3600) / 60;
+    let seconds = uptime % 60;
+
+    defmt::info!(
+        "Health: uptime={}h {}m {}s",
+        hours,
+        minutes,
+        seconds
+    );
+
+    // Log heap usage if we can get it
+    // Note: embedded-alloc doesn't provide easy introspection,
+    // but we log that the system is still running
+    defmt::info!("Health: main loop responsive, watchdog fed");
+}
 
 /// Scan I2C bus for devices and log results
 async fn scan_i2c_bus(i2c: &mut I2c<'static, I2C0, I2cAsync>) {
@@ -124,10 +243,20 @@ async fn main(spawner: Spawner) {
 
     let p = embassy_rp::init(Default::default());
 
+    // Initialize hardware watchdog
+    // If not fed within WATCHDOG_TIMEOUT_MS, the device will reset
+    let mut watchdog = Watchdog::new(p.WATCHDOG);
+    watchdog.start(Duration::from_millis(WATCHDOG_TIMEOUT_MS));
+    defmt::info!("Watchdog started with {}ms timeout", WATCHDOG_TIMEOUT_MS);
+
+    // Feed watchdog immediately
+    watchdog.feed();
+
     // Initialize random number generator for network stack
     let mut rng = RoscRng;
 
     defmt::info!("SCD40 CO2 Sensor with WiFi starting...");
+    defmt::info!("Build features: watchdog, separate network task, I2C recovery");
 
     // Initialize CYW43 (WiFi chip) for onboard LED and networking
     let fw = FIRMWARE;
@@ -147,6 +276,8 @@ async fn main(spawner: Spawner) {
         p.DMA_CH0,
     );
 
+    watchdog.feed();
+
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
     let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
@@ -156,6 +287,8 @@ async fn main(spawner: Spawner) {
     control
         .set_power_management(cyw43::PowerManagementMode::PowerSave)
         .await;
+
+    watchdog.feed();
 
     // Initialize network stack
     let net_config = NetConfig::dhcpv4(Default::default());
@@ -171,11 +304,18 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(net_task(net_runner)).unwrap();
 
+    // Start uptime tracking task
+    spawner.spawn(uptime_task()).unwrap();
+
     // Connect to WiFi
     defmt::info!("Connecting to WiFi network: {}", WIFI_SSID);
 
     loop {
-        match control.join(WIFI_SSID, JoinOptions::new(WIFI_PASSWORD.as_bytes())).await {
+        watchdog.feed();
+        match control
+            .join(WIFI_SSID, JoinOptions::new(WIFI_PASSWORD.as_bytes()))
+            .await
+        {
             Ok(()) => break,
             Err(e) => {
                 defmt::warn!("WiFi join failed: {}", Debug2Format(&e));
@@ -185,16 +325,41 @@ async fn main(spawner: Spawner) {
     }
 
     defmt::info!("WiFi connected, waiting for link...");
-    stack.wait_link_up().await;
+    watchdog.feed();
+
+    // Wait for link with timeout and watchdog feeding
+    let link_start = Instant::now();
+    while !stack.is_link_up() {
+        if link_start.elapsed() > Duration::from_secs(30) {
+            defmt::error!("Link timeout - resetting via watchdog");
+            loop {} // Watchdog will reset
+        }
+        watchdog.feed();
+        Timer::after(Duration::from_millis(100)).await;
+    }
 
     defmt::info!("Link up, waiting for DHCP...");
-    stack.wait_config_up().await;
+
+    // Wait for DHCP with timeout and watchdog feeding
+    let dhcp_start = Instant::now();
+    while stack.config_v4().is_none() {
+        if dhcp_start.elapsed() > Duration::from_secs(30) {
+            defmt::error!("DHCP timeout - resetting via watchdog");
+            loop {} // Watchdog will reset
+        }
+        watchdog.feed();
+        Timer::after(Duration::from_millis(100)).await;
+    }
 
     if let Some(config) = stack.config_v4() {
         defmt::info!("Got IP address: {}", Debug2Format(&config.address));
     }
 
     defmt::info!("Network ready!");
+    watchdog.feed();
+
+    // Start the API submission task (runs independently)
+    spawner.spawn(api_submit_task(stack)).unwrap();
 
     // Initialize PIO1 for WS2812B LEDs (PIO0 is used by CYW43 WiFi)
     // Using GPIO16 for LED data line (single wire)
@@ -213,19 +378,31 @@ async fn main(spawner: Spawner) {
     );
 
     defmt::info!("WS2812B LED controller initialized on GPIO16");
+    watchdog.feed();
 
-    // Initialize I2C bus for sensors
-    // Using GPIO4 (SDA) and GPIO5 (SCL)
-    let sda = p.PIN_4;
-    let scl = p.PIN_5;
+    // Prepare I2C pins for potential bus recovery
+    // GPIO4 (SDA) and GPIO5 (SCL)
+    let mut scl_pin = Output::new(p.PIN_5, Level::High);
+    let sda_pin = Output::new(p.PIN_4, Level::High);
+
+    // Perform I2C bus recovery before initializing
+    recover_i2c_bus(&mut scl_pin, &sda_pin);
+
+    // Convert pins back to I2C function
+    // We need to drop the Output wrappers and reinitialize
+    let sda = unsafe { embassy_rp::peripherals::PIN_4::steal() };
+    let scl = unsafe { embassy_rp::peripherals::PIN_5::steal() };
+
     let mut i2c = I2c::new_async(p.I2C0, scl, sda, Irqs, I2cConfig::default());
 
     // Wait for sensors to power up before scanning
     defmt::info!("Waiting for I2C devices to power up...");
     Timer::after(Duration::from_millis(2000)).await;
+    watchdog.feed();
 
     // Scan I2C bus to find devices
     scan_i2c_bus(&mut i2c).await;
+    watchdog.feed();
 
     // Create shared I2C bus
     static I2C_BUS: StaticCell<I2c0Bus> = StaticCell::new();
@@ -237,11 +414,13 @@ async fn main(spawner: Spawner) {
     let bmp280_i2c = I2cDevice::new(i2c_bus);
 
     // Initialize SCD40 CO2 sensor (0x62)
+    watchdog.feed();
     let mut scd40 = match Scd40Sensor::new(scd40_i2c).await {
         Ok(sensor) => sensor,
         Err(e) => {
             defmt::error!("Failed to initialize SCD40: {} - halting", e);
             loop {
+                watchdog.feed(); // Keep feeding so we can debug
                 control.gpio_set(0, true).await;
                 Timer::after(Duration::from_millis(100)).await;
                 control.gpio_set(0, false).await;
@@ -251,11 +430,13 @@ async fn main(spawner: Spawner) {
     };
 
     // Initialize AHT20 temperature/humidity sensor (0x38)
+    watchdog.feed();
     let mut aht20 = match Aht20Sensor::new(aht20_i2c).await {
         Ok(sensor) => sensor,
         Err(e) => {
             defmt::error!("Failed to initialize AHT20: {} - halting", e);
             loop {
+                watchdog.feed();
                 control.gpio_set(0, true).await;
                 Timer::after(Duration::from_millis(100)).await;
                 control.gpio_set(0, false).await;
@@ -265,11 +446,13 @@ async fn main(spawner: Spawner) {
     };
 
     // Initialize BMP280 pressure sensor (0x77)
+    watchdog.feed();
     let mut bmp280 = match Bmp280Sensor::new(bmp280_i2c).await {
         Ok(sensor) => sensor,
         Err(e) => {
             defmt::error!("Failed to initialize BMP280: {} - halting", e);
             loop {
+                watchdog.feed();
                 control.gpio_set(0, true).await;
                 Timer::after(Duration::from_millis(100)).await;
                 control.gpio_set(0, false).await;
@@ -279,12 +462,16 @@ async fn main(spawner: Spawner) {
     };
 
     // Wait for SCD40 warmup period with LED animation
-    defmt::info!("Waiting for SCD40 warmup period of {} seconds", WARMUP_TIME);
+    defmt::info!(
+        "Waiting for SCD40 warmup period of {} seconds",
+        WARMUP_TIME
+    );
     defmt::info!("LEDs will pulse during warmup...");
 
     // LED animation during warmup (default CO2 level shows green)
     let warmup_iterations = (WARMUP_TIME * 1000) / LED_UPDATE_MS;
     for i in 0..warmup_iterations {
+        watchdog.feed();
         let _ = led_controller.update(LED_UPDATE_MS as f32 / 1000.0).await;
         Timer::after(Duration::from_millis(LED_UPDATE_MS)).await;
 
@@ -296,21 +483,27 @@ async fn main(spawner: Spawner) {
     }
 
     defmt::info!("Warmup complete - starting continuous readings");
-
-    // Track network status for reconnection
-    let mut consecutive_network_failures: u8 = 0;
-    const MAX_FAILURES_BEFORE_RECONNECT: u8 = 3;
+    log_health();
 
     // Timing counters (in milliseconds)
     let mut ms_since_sensor_read: u64 = SENSOR_READ_SECS * 1000; // Trigger immediate read
     let mut ms_since_api_submit: u64 = API_SUBMIT_SECS * 1000; // Trigger immediate submit
+    let mut ms_since_health_log: u64 = 0;
+
+    // Track consecutive sensor failures for I2C recovery
+    let mut consecutive_i2c_failures: u8 = 0;
+    const MAX_I2C_FAILURES: u8 = 5;
 
     // Latest sensor readings for API submission
     let mut latest_readings: Option<SensorReadings> = None;
 
-    // Main loop - updates LEDs frequently, reads sensors periodically, submits to API occasionally
+    // Main loop - updates LEDs frequently, reads sensors periodically
+    // Network submission happens in separate task via channel
     loop {
-        // Update LED animation
+        // Feed watchdog at the start of each iteration
+        watchdog.feed();
+
+        // Update LED animation (this should never block significantly)
         let _ = led_controller.update(LED_UPDATE_MS as f32 / 1000.0).await;
 
         // Check if it's time to read sensors
@@ -320,12 +513,53 @@ async fn main(spawner: Spawner) {
             // Indicate reading with onboard LED
             control.gpio_set(0, true).await;
 
-            // Read all sensors
-            let co2_reading = scd40.wait_and_read_co2().await;
+            // Read all sensors with timeout protection
+            let sensor_timeout = Duration::from_secs(5);
+
+            let co2_result = embassy_time::with_timeout(
+                sensor_timeout,
+                scd40.wait_and_read_co2(),
+            )
+            .await;
+
+            let co2_reading = match co2_result {
+                Ok(result) => result,
+                Err(_) => {
+                    defmt::error!("SCD40 read timed out!");
+                    Err("Sensor timeout")
+                }
+            };
+
             let temp_humidity_reading = aht20.read().await;
             let pressure_reading = bmp280.read_pressure().await;
 
             // Combine readings if all successful
+            let read_success = matches!(
+                (&co2_reading, &temp_humidity_reading, &pressure_reading),
+                (Ok(_), Ok(_), Ok(_))
+            );
+
+            if read_success {
+                consecutive_i2c_failures = 0;
+            } else {
+                consecutive_i2c_failures = consecutive_i2c_failures.saturating_add(1);
+                defmt::warn!(
+                    "Sensor read failure ({}/{})",
+                    consecutive_i2c_failures,
+                    MAX_I2C_FAILURES
+                );
+
+                if consecutive_i2c_failures >= MAX_I2C_FAILURES {
+                    defmt::error!(
+                        "Too many consecutive I2C failures - watchdog will reset device"
+                    );
+                    // Stop feeding watchdog to trigger reset
+                    loop {
+                        Timer::after(Duration::from_secs(10)).await;
+                    }
+                }
+            }
+
             latest_readings = match (co2_reading, temp_humidity_reading, pressure_reading) {
                 (Ok(co2), Ok(th), Ok(pressure_hpa)) => {
                     let temperature_c = th.temperature_c;
@@ -333,7 +567,10 @@ async fn main(spawner: Spawner) {
 
                     defmt::info!(
                         "CO2: {} ppm, Temp: {} F, Humidity: {}%, Pressure: {} hPa",
-                        co2, temperature_f, th.humidity_percent, pressure_hpa
+                        co2,
+                        temperature_f,
+                        th.humidity_percent,
+                        pressure_hpa
                     );
 
                     // Update LED color based on CO2 reading
@@ -364,80 +601,33 @@ async fn main(spawner: Spawner) {
             control.gpio_set(0, false).await;
         }
 
-        // Check if it's time to submit to API
+        // Check if it's time to submit to API (via channel to network task)
         if ms_since_api_submit >= API_SUBMIT_SECS * 1000 {
             ms_since_api_submit = 0;
 
-            // Check network status and attempt reconnection if needed
-            if check_network_status(stack) == NetworkStatus::Disconnected {
-                defmt::warn!("Network disconnected, attempting to reconnect...");
-
-                // Attempt to rejoin WiFi
-                match control.join(WIFI_SSID, JoinOptions::new(WIFI_PASSWORD.as_bytes())).await {
+            // Send readings to network task via channel (non-blocking try_send)
+            if let Some(readings) = latest_readings {
+                match SENSOR_CHANNEL.try_send(readings) {
                     Ok(()) => {
-                        defmt::info!("WiFi rejoined, waiting for link...");
-
-                        // Wait for link with timeout
-                        let link_timeout = embassy_time::with_timeout(
-                            Duration::from_secs(10),
-                            stack.wait_link_up(),
-                        )
-                        .await;
-
-                        if link_timeout.is_ok() {
-                            // Wait for DHCP with timeout
-                            let dhcp_timeout = embassy_time::with_timeout(
-                                Duration::from_secs(15),
-                                stack.wait_config_up(),
-                            )
-                            .await;
-
-                            if dhcp_timeout.is_ok() {
-                                if let Some(config) = stack.config_v4() {
-                                    defmt::info!("Reconnected with IP: {}", Debug2Format(&config.address));
-                                }
-                                consecutive_network_failures = 0;
-                            } else {
-                                defmt::warn!("DHCP timeout during reconnection");
-                            }
-                        } else {
-                            defmt::warn!("Link timeout during reconnection");
-                        }
+                        defmt::debug!("Sent readings to network task");
                     }
-                    Err(e) => {
-                        defmt::warn!("WiFi rejoin failed: {}", Debug2Format(&e));
+                    Err(_) => {
+                        defmt::warn!("Network task channel full, skipping submission");
                     }
                 }
             }
+        }
 
-            // Submit data to API if readings are available
-            if let Some(r) = &latest_readings {
-                let payload = SensorPayload::new(r);
-
-                match submit_sensor_data(stack, &payload, &mut rng).await {
-                    Ok(()) => {
-                        defmt::debug!("Data submitted to API");
-                        consecutive_network_failures = 0;
-                    }
-                    Err(e) => {
-                        defmt::warn!("API submission failed: {}", e);
-
-                        consecutive_network_failures = consecutive_network_failures.saturating_add(1);
-
-                        if consecutive_network_failures >= MAX_FAILURES_BEFORE_RECONNECT {
-                            defmt::warn!(
-                                "Multiple consecutive failures ({}), will check network next cycle",
-                                consecutive_network_failures
-                            );
-                        }
-                    }
-                }
-            }
+        // Periodic health logging
+        if ms_since_health_log >= HEALTH_LOG_SECS * 1000 {
+            ms_since_health_log = 0;
+            log_health();
         }
 
         // Wait for next LED update cycle
         Timer::after(Duration::from_millis(LED_UPDATE_MS)).await;
         ms_since_sensor_read += LED_UPDATE_MS;
         ms_since_api_submit += LED_UPDATE_MS;
+        ms_since_health_log += LED_UPDATE_MS;
     }
 }

@@ -1,10 +1,11 @@
 //! Shared types for sensor readings and network status.
 
 use core::fmt::Write as _;
+use defmt::Format;
 use heapless::String;
 
 /// Combined sensor readings from all sensors
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Format)]
 pub struct SensorReadings {
     pub co2: u16,
     pub temperature_c: f32,

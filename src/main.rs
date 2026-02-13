@@ -36,7 +36,8 @@ use embassy_net::Config as NetConfig;
 use embassy_net::StackResources;
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
-use embassy_rp::gpio::{Level, Output};
+use embassy_rp::adc::{Adc, Channel as AdcChannel, Config as AdcConfig, InterruptHandler as AdcInterruptHandler};
+use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::i2c::{Async as I2cAsync, Config as I2cConfig, I2c, InterruptHandler as I2cInterruptHandler};
 use embassy_rp::peripherals::{DMA_CH0, I2C0, PIO0, PIO1};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
@@ -48,7 +49,7 @@ use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Instant, Timer};
 use static_cell::StaticCell;
 
-use crate::leds::LedController;
+use crate::leds::{ButtonState, LedController};
 use crate::network::{check_network_status, submit_sensor_data};
 use crate::sensors::{Aht20Sensor, Bmp280Sensor, Scd40Sensor};
 use crate::types::{NetworkStatus, SensorPayload, SensorReadings};
@@ -59,6 +60,7 @@ bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
     PIO1_IRQ_0 => PioInterruptHandler<PIO1>;
     I2C0_IRQ => I2cInterruptHandler<I2C0>;
+    ADC_IRQ_FIFO => AdcInterruptHandler;
 });
 
 // WiFi configuration loaded from .env file at build time
@@ -380,6 +382,17 @@ async fn main(spawner: Spawner) {
     defmt::info!("WS2812B LED controller initialized on GPIO16");
     watchdog.feed();
 
+    // Initialize ADC for LDR photoresistor on GPIO28 (ADC2)
+    let mut adc = Adc::new(p.ADC, Irqs, AdcConfig::default());
+    let mut ldr_channel = AdcChannel::new_pin(p.PIN_28, Pull::None);
+    let mut smoothed_adc: f32 = 2048.0; // Start at midpoint
+    defmt::info!("LDR photoresistor initialized on GPIO28 (ADC2)");
+
+    // Initialize button on GPIO1 (active low with internal pull-up)
+    let button = Input::new(p.PIN_1, Pull::Up);
+    let mut button_press_start: Option<Instant> = None;
+    defmt::info!("Button initialized on GPIO1");
+
     // Prepare I2C pins for potential bus recovery
     // GPIO4 (SDA) and GPIO5 (SCL)
     let mut scl_pin = Output::new(p.PIN_5, Level::High);
@@ -472,6 +485,25 @@ async fn main(spawner: Spawner) {
     let warmup_iterations = (WARMUP_TIME * 1000) / LED_UPDATE_MS;
     for i in 0..warmup_iterations {
         watchdog.feed();
+
+        // Read ambient light and update brightness
+        if let Ok(raw) = adc.read(&mut ldr_channel).await {
+            smoothed_adc = smoothed_adc * 0.95 + raw as f32 * 0.05;
+            led_controller.set_ambient_light(smoothed_adc as u16);
+        }
+
+        // Handle button state
+        if button.is_low() {
+            let start = *button_press_start.get_or_insert(Instant::now());
+            if start.elapsed() > Duration::from_secs(3) {
+                led_controller.set_button_state(ButtonState::LongPressed);
+            } else {
+                led_controller.set_button_state(ButtonState::Pressed);
+            }
+        } else if button_press_start.take().is_some() {
+            led_controller.set_button_state(ButtonState::Released);
+        }
+
         let _ = led_controller.update(LED_UPDATE_MS as f32 / 1000.0).await;
         Timer::after(Duration::from_millis(LED_UPDATE_MS)).await;
 
@@ -502,6 +534,24 @@ async fn main(spawner: Spawner) {
     loop {
         // Feed watchdog at the start of each iteration
         watchdog.feed();
+
+        // Read ambient light and update brightness
+        if let Ok(raw) = adc.read(&mut ldr_channel).await {
+            smoothed_adc = smoothed_adc * 0.95 + raw as f32 * 0.05;
+            led_controller.set_ambient_light(smoothed_adc as u16);
+        }
+
+        // Handle button state
+        if button.is_low() {
+            let start = *button_press_start.get_or_insert(Instant::now());
+            if start.elapsed() > Duration::from_secs(3) {
+                led_controller.set_button_state(ButtonState::LongPressed);
+            } else {
+                led_controller.set_button_state(ButtonState::Pressed);
+            }
+        } else if button_press_start.take().is_some() {
+            led_controller.set_button_state(ButtonState::Released);
+        }
 
         // Update LED animation (this should never block significantly)
         let _ = led_controller.update(LED_UPDATE_MS as f32 / 1000.0).await;

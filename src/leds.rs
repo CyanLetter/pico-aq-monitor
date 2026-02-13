@@ -44,6 +44,47 @@ mod colors {
 
     /// Red - poor air quality (> 900 ppm)
     pub const RED: RGB8 = RGB8::new(255, 30, 0);
+
+    /// Purple - button pressed indicator
+    pub const PURPLE: RGB8 = RGB8::new(128, 0, 255);
+
+    /// Bright white - button long-press indicator
+    pub const WHITE: RGB8 = RGB8::new(255, 255, 255);
+}
+
+/// Button press state for LED color override
+#[derive(Clone, Copy, PartialEq)]
+pub enum ButtonState {
+    /// Button not pressed - normal CO2-based colors
+    Released,
+    /// Button pressed - show purple
+    Pressed,
+    /// Button held for 3+ seconds - show bright white
+    LongPressed,
+}
+
+/// Map an ADC reading from an LDR photoresistor to maximum LED brightness.
+///
+/// Assumes a voltage divider where higher ADC values = more ambient light.
+/// Brighter environments allow higher LED brightness; darker environments
+/// reduce brightness to avoid being blinding.
+///
+/// ADC input range: 0-4095 (12-bit). Output: 0.05-1.0.
+pub fn adc_to_max_brightness(adc_value: u16) -> f32 {
+    let adc = adc_value.min(4095) as f32;
+
+    if adc < 100.0 {
+        0.05
+    } else if adc < 1000.0 {
+        let t = (adc - 100.0) / 900.0;
+        0.05 + t * (0.20 - 0.05)
+    } else if adc < 2500.0 {
+        let t = (adc - 1000.0) / 1500.0;
+        0.20 + t * (0.60 - 0.20)
+    } else {
+        let t = (adc - 2500.0) / 1595.0;
+        0.60 + t * (1.0 - 0.60)
+    }
 }
 
 /// Get the base color for a given CO2 level
@@ -119,6 +160,8 @@ pub struct LedController<'d> {
     ws: PioWs2812<'d, PIO1, 0, NUM_LEDS, Grb>,
     current_co2: u16,
     time_counter: f32,
+    max_brightness: f32,
+    override_color: Option<RGB8>,
 }
 
 impl<'d> LedController<'d> {
@@ -136,12 +179,30 @@ impl<'d> LedController<'d> {
             ws: PioWs2812::new(common, sm, dma, pin, program),
             current_co2: 400, // Default to good air quality
             time_counter: 0.0,
+            max_brightness: 1.0,
+            override_color: None,
         }
     }
 
     /// Update the CO2 reading for color selection
     pub fn set_co2(&mut self, co2_ppm: u16) {
         self.current_co2 = co2_ppm;
+    }
+
+    /// Set maximum LED brightness based on ambient light sensor reading.
+    ///
+    /// Pass the raw 12-bit ADC value from the LDR photoresistor.
+    pub fn set_ambient_light(&mut self, adc_value: u16) {
+        self.max_brightness = adc_to_max_brightness(adc_value);
+    }
+
+    /// Set button state for LED color override.
+    pub fn set_button_state(&mut self, state: ButtonState) {
+        self.override_color = match state {
+            ButtonState::Released => None,
+            ButtonState::Pressed => Some(colors::PURPLE),
+            ButtonState::LongPressed => Some(colors::WHITE),
+        };
     }
 
     /// Advance animation time and update LEDs
@@ -155,23 +216,27 @@ impl<'d> LedController<'d> {
             self.time_counter -= 1000.0;
         }
 
-        let base_color = co2_to_color(self.current_co2);
+        let base_color = self.override_color.unwrap_or_else(|| co2_to_color(self.current_co2));
         let mut led_colors = [RGB8::default(); NUM_LEDS];
 
         // Animation parameters
         // With gamma correction (γ=2.0), brightness is perceptually linear
         // so we can use a wider range for more visible animation
         const WAVE_SPEED: f32 = 4.0; // Slow, gentle pulse
-        const MIN_BRIGHTNESS: f32 = 0.05; // More visible minimum with gamma
-        const MAX_BRIGHTNESS: f32 = 1.0; // Brighter max now that low end is usable
+        const BASE_MIN: f32 = 0.05;
+        const BASE_MAX: f32 = 1.0;
+
+        // Scale brightness range by ambient light level
+        let effective_min = BASE_MIN * self.max_brightness;
+        let effective_max = BASE_MAX * self.max_brightness;
 
         for i in 0..NUM_LEDS {
             let brightness = pulse_brightness(
                 i,
                 self.time_counter,
                 WAVE_SPEED,
-                MIN_BRIGHTNESS,
-                MAX_BRIGHTNESS,
+                effective_min,
+                effective_max,
             );
             led_colors[i] = scale_color(base_color, brightness);
         }

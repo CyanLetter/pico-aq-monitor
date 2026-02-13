@@ -614,13 +614,14 @@ async fn main(spawner: Spawner) {
                 (Ok(co2), Ok(th), Ok(pressure_hpa)) => {
                     let temperature_c = th.temperature_c;
                     let temperature_f = (temperature_c * 1.8) + 32.0;
+                    let brightness = smoothed_adc as u16;
 
                     defmt::info!(
-                        "CO2: {} ppm, Temp: {} F, Humidity: {}%, Pressure: {} hPa",
+                        "CO2: {} ppm, Temp: {} F, Humidity: {}%, Pressure: {} hPa, Brightness: {}",
                         co2,
                         temperature_f,
                         th.humidity_percent,
-                        pressure_hpa
+                        pressure_hpa, brightness
                     );
 
                     // Update LED color based on CO2 reading
@@ -632,6 +633,7 @@ async fn main(spawner: Spawner) {
                         temperature_f,
                         humidity_percent: th.humidity_percent,
                         pressure_hpa,
+                        brightness,
                     })
                 }
                 (Err(e), _, _) => {

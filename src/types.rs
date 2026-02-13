@@ -12,6 +12,7 @@ pub struct SensorReadings {
     pub temperature_f: f32,
     pub humidity_percent: f32,
     pub pressure_hpa: f32,
+    pub brightness: u16,
 }
 
 /// Sensor payload for API submission
@@ -21,6 +22,7 @@ pub struct SensorPayload {
     pub humidity_percent: f32,
     pub pressure_hpa: f32,
     pub co2: u16,
+    pub brightness: u16,
 }
 
 impl SensorPayload {
@@ -32,6 +34,7 @@ impl SensorPayload {
             humidity_percent: readings.humidity_percent,
             pressure_hpa: readings.pressure_hpa,
             co2: readings.co2,
+            brightness: readings.brightness,
         }
     }
 
@@ -40,12 +43,13 @@ impl SensorPayload {
         let mut json: String<512> = String::new();
         let _ = write!(
             json,
-            r#"{{"temperature_c":{:.2},"temperature_f":{:.2},"humidity_percent":{:.2},"pressure_hpa":{:.2},"co2":{}}}"#,
+            r#"{{"temperature_c":{:.2},"temperature_f":{:.2},"humidity_percent":{:.2},"pressure_hpa":{:.2},"co2":{},"brightness":{}}}"#,
             self.temperature_c,
             self.temperature_f,
             self.humidity_percent,
             self.pressure_hpa,
-            self.co2
+            self.co2,
+            self.brightness
         );
         json
     }

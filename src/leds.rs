@@ -24,26 +24,22 @@ const GAMMA: f32 = 2.0;
 
 /// CO2 thresholds for color changes (in ppm)
 mod thresholds {
-    pub const GREEN_MAX: u16 = 450;
-    pub const BLUE_MAX: u16 = 650;
-    pub const AMBER_MAX: u16 = 950;
+    pub const BEST_MAX: u16 = 500;
+    pub const OK_MAX: u16 = 900;
 }
 
 /// Base colors for each CO2 level
 mod colors {
     use smart_leds::RGB8;
 
-    /// Green - excellent air quality (< 450 ppm)
-    pub const GREEN: RGB8 = RGB8::new(0, 255, 50);
+    /// Green - excellent air quality (< 500 ppm)
+    pub const COLOR_BEST: RGB8 = RGB8::new(0, 255, 50);
 
-    /// Cool blue - good air quality (450-600 ppm)
-    pub const BLUE: RGB8 = RGB8::new(0, 150, 255);
-
-    /// Amber - moderate air quality (600-900 ppm)
-    pub const AMBER: RGB8 = RGB8::new(255, 150, 0);
+    /// Amber - Acceptable air quality (500-900 ppm)
+    pub const COLOR_OK: RGB8 = RGB8::new(255, 160, 50);
 
     /// Red - poor air quality (> 900 ppm)
-    pub const RED: RGB8 = RGB8::new(255, 30, 0);
+    pub const COLOR_BAD: RGB8 = RGB8::new(255, 30, 0);
 
     /// Purple - button pressed indicator
     pub const PURPLE: RGB8 = RGB8::new(128, 0, 255);
@@ -69,34 +65,40 @@ pub enum ButtonState {
 /// Brighter environments allow higher LED brightness; darker environments
 /// reduce brightness to avoid being blinding.
 ///
-/// ADC input range: 0-4095 (12-bit). Output: 0.05-1.0.
+/// ADC input range: 0-4095 (12-bit). Output: 0.3-1.0.
+///
+/// Only fades below the midpoint (~2048). Above that, LEDs run at full brightness.
+///
+/// - ADC 0-500 (dark): fixed at 0.3 (floor).
+/// - ADC 500-2048 (dim to moderate): linearly interpolates from 0.3 to 1.0.
+///   `t` normalizes the ADC value within this band to 0.0-1.0, then
+///   `0.3 + t * 0.7` scales from the floor up to full brightness.
+/// - ADC 2048-4095 (bright): fixed at 1.0 (full brightness).
 pub fn adc_to_max_brightness(adc_value: u16) -> f32 {
     let adc = adc_value.min(4095) as f32;
 
-    if adc < 100.0 {
-        0.05
-    } else if adc < 1000.0 {
-        let t = (adc - 100.0) / 900.0;
-        0.05 + t * (0.20 - 0.05)
-    } else if adc < 2500.0 {
-        let t = (adc - 1000.0) / 1500.0;
-        0.20 + t * (0.60 - 0.20)
+    if adc < 500.0 {
+        // Dark environment — hold at minimum brightness floor
+        0.3
+    } else if adc < 2048.0 {
+        // Dim-to-moderate — linear ramp from 0.3 to 1.0
+        // t = 0.0 at ADC 500, t = 1.0 at ADC 2048
+        let t = (adc - 500.0) / (2048.0 - 500.0);
+        0.3 + t * (1.0 - 0.3)
     } else {
-        let t = (adc - 2500.0) / 1595.0;
-        0.60 + t * (1.0 - 0.60)
+        // Bright environment — full brightness
+        1.0
     }
 }
 
 /// Get the base color for a given CO2 level
 fn co2_to_color(co2_ppm: u16) -> RGB8 {
-    if co2_ppm < thresholds::GREEN_MAX {
-        colors::GREEN
-    } else if co2_ppm < thresholds::BLUE_MAX {
-        colors::BLUE
-    } else if co2_ppm < thresholds::AMBER_MAX {
-        colors::AMBER
+    if co2_ppm < thresholds::BEST_MAX {
+        colors::COLOR_BEST
+    } else if co2_ppm < thresholds::OK_MAX {
+        colors::COLOR_OK
     } else {
-        colors::RED
+        colors::COLOR_BAD
     }
 }
 
@@ -222,8 +224,8 @@ impl<'d> LedController<'d> {
         // Animation parameters
         // With gamma correction (γ=2.0), brightness is perceptually linear
         // so we can use a wider range for more visible animation
-        const WAVE_SPEED: f32 = 4.0; // Slow, gentle pulse
-        const BASE_MIN: f32 = 0.05;
+        const WAVE_SPEED: f32 = 2.0; // Slow, gentle pulse
+        const BASE_MIN: f32 = 0.1;
         const BASE_MAX: f32 = 1.0;
 
         // Scale brightness range by ambient light level

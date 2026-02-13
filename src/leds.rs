@@ -13,7 +13,7 @@ use libm::{powf, sinf};
 use smart_leds::RGB8;
 
 /// Number of LEDs in the array
-pub const NUM_LEDS: usize = 8;
+pub const NUM_LEDS: usize = 16;
 
 /// Gamma correction value for WS2812B LEDs
 ///
@@ -25,8 +25,8 @@ const GAMMA: f32 = 2.0;
 /// CO2 thresholds for color changes (in ppm)
 mod thresholds {
     pub const GREEN_MAX: u16 = 450;
-    pub const BLUE_MAX: u16 = 600;
-    pub const AMBER_MAX: u16 = 900;
+    pub const BLUE_MAX: u16 = 650;
+    pub const AMBER_MAX: u16 = 950;
 }
 
 /// Base colors for each CO2 level
@@ -161,9 +161,9 @@ impl<'d> LedController<'d> {
         // Animation parameters
         // With gamma correction (γ=2.0), brightness is perceptually linear
         // so we can use a wider range for more visible animation
-        const WAVE_SPEED: f32 = 8.0; // Slow, gentle pulse
+        const WAVE_SPEED: f32 = 4.0; // Slow, gentle pulse
         const MIN_BRIGHTNESS: f32 = 0.05; // More visible minimum with gamma
-        const MAX_BRIGHTNESS: f32 = 0.3; // Brighter max now that low end is usable
+        const MAX_BRIGHTNESS: f32 = 1.0; // Brighter max now that low end is usable
 
         for i in 0..NUM_LEDS {
             let brightness = pulse_brightness(
